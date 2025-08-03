@@ -1,5 +1,5 @@
 import 'dart:io';
-
+// falcon (falconc FalconCompiler) - copyrigjt -: 2025-Present Abhigyan Ghosh. All rights reserved.
 void main(List<String> args) {
   if (args.length < 3) {
     print("Usage: dart falcon.dart <source.fl> <output.dart>");
