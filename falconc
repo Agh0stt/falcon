@@ -1,0 +1,55 @@
+#!/bin/bash
+
+FALCON_SCRIPT="falcon.dart"
+INSTALL_DIR_LIB="/usr/local/lib"
+INSTALL_DIR_BIN="/usr/local/bin"
+
+# Detect Termux
+if [ -n "$PREFIX" ] && [[ "$PREFIX" == *com.termux* ]]; then
+    INSTALL_DIR_LIB="$PREFIX/lib"
+    INSTALL_DIR_BIN="$PREFIX/bin"
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# Install compiler
+$SUDO mkdir -p "$INSTALL_DIR_LIB"
+$SUDO cp "$FALCON_SCRIPT" "$INSTALL_DIR_LIB/falcon.dart"
+
+# Install CLI launcher
+cat <<EOF | $SUDO tee "$INSTALL_DIR_BIN/falcon" > /dev/null
+#!/bin/bash
+FALCON_COMPILER="$INSTALL_DIR_LIB/falcon.dart"
+
+if [ "\$1" = "run" ]; then
+    SOURCE="\$2"
+    TEMP_DART="temp.dart"
+    TEMP_BIN="temp_bin"
+
+    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "\$TEMP_BIN" || exit 1
+
+    chmod +x "\$TEMP_BIN"
+    "./\$TEMP_BIN"
+    rm -f "\$TEMP_DART" "\$TEMP_BIN"
+
+elif [ "\$1" = "build" ]; then
+    SOURCE="\$2"
+    OUTPUT="\$4"
+    TEMP_DART="temp.dart"
+
+    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "\$OUTPUT" || exit 1
+    rm -f "\$TEMP_DART"
+
+else
+    echo "Usage:"
+    echo "  falcon run <source.fl>"
+    echo "  falcon build <source.fl> -o <output_binary>"
+fi
+EOF
+
+$SUDO chmod +x "$INSTALL_DIR_BIN/falcon"
+
+echo "Falcon installed."
+echo "Use: falcon run file.fl"
+echo "     falcon build file.fl -o output_bin"
