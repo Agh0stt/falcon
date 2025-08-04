@@ -144,15 +144,79 @@ else if (line.startsWith('} while')) {
   }
 }
 
-  else if (line.startsWith('func ')) {
-  final funcMatch = RegExp(r'func\s+(\w+)\((.*?)\)\s*(->\s*(int|double|bool|String|void))?').firstMatch(line);
+  // ===== Functions (C-like syntax, strict typing, no semicolon in Falcon)
+else if (RegExp(r'^(void|int|bool|str|double)\s+\w+\s*\(').hasMatch(line)) {
+  final funcMatch = RegExp(r'^(void|int|bool|str|double)\s+(\w+)\((.*?)\)')
+      .firstMatch(line);
+
   if (funcMatch != null) {
-    final funcName = funcMatch.group(1)!;
-    final params = funcMatch.group(2)!;
-    final returnType = funcMatch.group(4) ?? 'void';
-    dartCode.writeln('$returnType $funcName($params) {');
+    var returnTypeKeyword = funcMatch.group(1)!;
+    final funcName = funcMatch.group(2)!;
+    final params = funcMatch.group(3)!;
+
+    // Map Falcon types to Dart types
+    switch (returnTypeKeyword) {
+      case 'int':
+        returnTypeKeyword = 'int';
+        break;
+      case 'bool':
+        returnTypeKeyword = 'bool';
+        break;
+      case 'str':
+        returnTypeKeyword = 'String';
+        break;
+      case 'double':
+        returnTypeKeyword = 'double';
+        break;
+      case 'void':
+      default:
+        returnTypeKeyword = 'void';
+    }
+
+    // Force typed parameters like C
+    final typedParams = params.trim().isEmpty
+        ? ''
+        : params.split(',')
+            .map((p) {
+              final parts = p.trim().split(RegExp(r'\s+'));
+              if (parts.length != 2) {
+                throw Exception("Invalid parameter in function $funcName. Use: type name");
+              }
+              var type = parts[0];
+              if (type == 'str') type = 'String';
+              return '$type ${parts[1]}';
+            })
+            .join(', ');
+
+    dartCode.writeln('$returnTypeKeyword $funcName($typedParams) {');
   }
-} 
+}
+    // ===== Return statements
+else if (line.trim().startsWith('return')) {
+  var returnContent = line.trim().substring(6).trim();
+
+  // If nothing after return → just return;
+  if (returnContent.isEmpty) {
+    dartCode.writeln('  return;');
+  } else {
+    dartCode.writeln('  return $returnContent;');
+  }
+}
+    else if (RegExp(r'^(int|bool|str|double)\s+\w+$').hasMatch(line)) {
+  final match = RegExp(r'^(int|bool|str|double)\s+(\w+)$').firstMatch(line)!;
+  var type = match.group(1)!;
+  final name = match.group(2)!;
+
+  // Map Falcon types to Dart nullable types
+  switch (type) {
+    case 'int': type = 'int?'; break;
+    case 'bool': type = 'bool?'; break;
+    case 'str': type = 'String?'; break;
+    case 'double': type = 'double?'; break;
+  }
+
+  dartCode.writeln('  $type $name;');
+    }
 
 else if (line.startsWith('switch ')) {
   final expr = line.substring(7, line.length - 1).trim();
