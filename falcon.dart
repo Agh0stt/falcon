@@ -31,7 +31,7 @@ int fallthroughLabelCounter = 0;
     line = line.trim();
 
     // print with comma concat and interpolation
- if (line.startsWith('print(')) {
+if (line.startsWith('print(')) {
   var inside = line.substring(6, line.length - 1).trim();
 
   // Replace commas with + for concatenation
@@ -41,6 +41,12 @@ int fallthroughLabelCounter = 0;
   inside = inside.replaceAllMapped(RegExp(r'\$([a-zA-Z_]\w*)'), (match) {
     return '\${${match.group(1)}}';
   });
+
+  // Convert everything after + to string
+  inside = inside.replaceAllMapped(
+    RegExp(r'(\+\s*)(\w+)'),
+    (match) => '${match.group(1)}${match.group(2)}.toString()'
+  );
 
   dartCode.writeln('  print($inside);');
 }
