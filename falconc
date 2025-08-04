@@ -28,13 +28,61 @@ if [ "\$1" = "run" ]; then
     TEMP_BIN="temp_bin"
 
     dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "\$TEMP_BIN" || exit 1
-
     chmod +x "\$TEMP_BIN"
     "./\$TEMP_BIN"
     rm -f "\$TEMP_DART" "\$TEMP_BIN"
 
 elif [ "\$1" = "build" ]; then
     SOURCE="\$2"
+    OUTPUT="\$4"
+    TEMP_DART="temp.dart"
+
+    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "\$OUTPUT" || exit 1
+    rm -f "\$TEMP_DART"
+
+elif [ "\$1" = "build-2js" ]; then
+    SOURCE="\$2"
+    OUTPUT="\$4"
+    TEMP_DART="temp.dart"
+
+    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" temp_bin || exit 1
+    
+    if [[ "\$5" == "--minify" ]]; then
+        dart compile js "\$TEMP_DART" -m -o "\$OUTPUT" || exit 1
+    else
+        dart compile js "\$TEMP_DART" -o "\$OUTPUT" || exit 1
+    fi
+    
+    rm -f "\$TEMP_DART" temp_bin
+
+elif [ "\$1" = "run-2js" ]; then
+    SOURCE="\$2"
+    TEMP_DART="temp.dart"
+    TEMP_JS="temp.js"
+
+    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" temp_bin || exit 1
+    dart compile js "\$TEMP_DART" -o "\$TEMP_JS" || exit 1
+    node "\$TEMP_JS"
+    
+    rm -f "\$TEMP_DART" "\$TEMP_JS" temp_bin
+
+else
+    echo "Usage:"
+    echo "  falcon run <source.fl>"
+    echo "  falcon build <source.fl> -o <output_binary>"
+    echo "  falcon build-2js <source.fl> -o <output_js> [--minify]"
+    echo "  falcon run-2js <source.fl>"
+fi
+EOF
+
+$SUDO chmod +x "$INSTALL_DIR_BIN/falcon"
+
+echo "Falcon installed."
+echo "Created by Abhigyan Ghosh"
+echo "Use: falcon run file.fl"
+echo "     falcon build file.fl -o output_bin"
+echo "     falcon build-2js file.fl -o output.js [--minify]"
+echo "     falcon run-2js file.fl"    SOURCE="\$2"
     OUTPUT="\$4"
     TEMP_DART="temp.dart"
 
