@@ -74,8 +74,43 @@ elif [ "\$1" = "make-project" ]; then
     fi
     mkdir -p "\$PROJECT_NAME/bin"
     echo "name=\$PROJECT_NAME" > "\$PROJECT_NAME/falcon.config"
-    echo 'print("Hello from Falcon!")' > "\$PROJECT_NAME/main.fl"
+    echo 'print("Hello from Falcon!");' > "\$PROJECT_NAME/main.fl"
     echo "Falcon project '\$PROJECT_NAME' created."
+
+elif [ "\$1" = "compile-project" ]; then
+    if [ ! -f "falcon.config" ]; then
+        echo "falcon.config not found. Not a Falcon project directory."
+        exit 1
+    fi
+
+    PROJECT_NAME=\$(grep "^name=" falcon.config | cut -d'=' -f2)
+    mkdir -p bin
+
+    if [ -z "\$2" ]; then
+        # No source specified, compile main.fl
+        if [ ! -f "main.fl" ]; then
+            echo "main.fl not found."
+            exit 1
+        fi
+        echo "Compiling main.fl → bin/\$PROJECT_NAME"
+        TEMP_DART="temp.dart"
+        dart "\$FALCON_COMPILER" "main.fl" "\$TEMP_DART" "bin/\$PROJECT_NAME" || exit 1
+        rm -f "\$TEMP_DART"
+        echo "Compiled bin/\$PROJECT_NAME"
+    else
+        # Custom file and output name
+        SOURCE="\$2"
+        OUTPUT="\$3"
+        if [ -z "\$OUTPUT" ]; then
+            echo "Please specify output name."
+            exit 1
+        fi
+        echo "Compiling \$SOURCE → bin/\$OUTPUT"
+        TEMP_DART="temp.dart"
+        dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "bin/\$OUTPUT" || exit 1
+        rm -f "\$TEMP_DART"
+        echo " Compiled bin/\$OUTPUT"
+    fi
 
 else
     echo "Usage:"
@@ -84,6 +119,7 @@ else
     echo "  falcon build-2js <source.fl> -o <output_js> [--minify]"
     echo "  falcon run-2js <source.fl>"
     echo "  falcon make-project <name>"
+    echo "  falcon compile-project [source.fl outputname]"
 fi
 EOF
 
@@ -96,3 +132,4 @@ echo "     falcon build file.fl -o output_bin"
 echo "     falcon build-2js file.fl -o output.js [--minify]"
 echo "     falcon run-2js file.fl"
 echo "     falcon make-project <name>"
+echo "     falcon compile-project [source.fl outputname]"
