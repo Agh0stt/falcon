@@ -66,12 +66,24 @@ elif [ "\$1" = "run-2js" ]; then
     
     rm -f "\$TEMP_DART" "\$TEMP_JS" temp_bin
 
+elif [ "\$1" = "make-project" ]; then
+    PROJECT_NAME="\$2"
+    if [ -z "\$PROJECT_NAME" ]; then
+        echo "Please provide a project name."
+        exit 1
+    fi
+    mkdir -p "\$PROJECT_NAME/bin"
+    echo "name=\$PROJECT_NAME" > "\$PROJECT_NAME/falcon.config"
+    echo 'print("Hello from Falcon!")' > "\$PROJECT_NAME/main.fl"
+    echo "Falcon project '\$PROJECT_NAME' created."
+
 else
     echo "Usage:"
     echo "  falcon run <source.fl>"
     echo "  falcon build <source.fl> -o <output_binary>"
     echo "  falcon build-2js <source.fl> -o <output_js> [--minify]"
     echo "  falcon run-2js <source.fl>"
+    echo "  falcon make-project <name>"
 fi
 EOF
 
@@ -82,22 +94,5 @@ echo "Created by Abhigyan Ghosh"
 echo "Use: falcon run file.fl"
 echo "     falcon build file.fl -o output_bin"
 echo "     falcon build-2js file.fl -o output.js [--minify]"
-echo "     falcon run-2js file.fl"    SOURCE="\$2"
-    OUTPUT="\$4"
-    TEMP_DART="temp.dart"
-
-    dart "\$FALCON_COMPILER" "\$SOURCE" "\$TEMP_DART" "\$OUTPUT" || exit 1
-    rm -f "\$TEMP_DART"
-
-else
-    echo "Usage:"
-    echo "  falcon run <source.fl>"
-    echo "  falcon build <source.fl> -o <output_binary>"
-fi
-EOF
-
-$SUDO chmod +x "$INSTALL_DIR_BIN/falcon"
-
-echo "Falcon installed."
-echo "Use: falcon run file.fl"
-echo "     falcon build file.fl -o output_bin"
+echo "     falcon run-2js file.fl"
+echo "     falcon make-project <name>"
