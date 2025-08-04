@@ -202,22 +202,7 @@ else if (line.trim().startsWith('return')) {
     dartCode.writeln('  return $returnContent;');
   }
 }
-    else if (RegExp(r'^(int|bool|str|double)\s+\w+$').hasMatch(line)) {
-  final match = RegExp(r'^(int|bool|str|double)\s+(\w+)$').firstMatch(line)!;
-  var type = match.group(1)!;
-  final name = match.group(2)!;
-
-  // Map Falcon types to Dart nullable types
-  switch (type) {
-    case 'int': type = 'int?'; break;
-    case 'bool': type = 'bool?'; break;
-    case 'str': type = 'String?'; break;
-    case 'double': type = 'double?'; break;
-  }
-
-  dartCode.writeln('  $type $name;');
-    }
-
+    
 else if (line.startsWith('switch ')) {
   final expr = line.substring(7, line.length - 1).trim();
   dartCode.writeln('switch ($expr) {');
