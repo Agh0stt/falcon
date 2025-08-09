@@ -234,10 +234,6 @@ else if (line.startsWith('default')) {
   dartCode.writeln('  default:');
 }
 
-else if (line.trim() == '}') {
-  dartCode.writeln('}');
-}
-
 
    else if (line.startsWith('if ') || line.startsWith('else if') || line.startsWith('else')) {
   dartCode.writeln('  $line');
