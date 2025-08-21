@@ -24,7 +24,6 @@ void writeFile(String path, String contents) {
   File(path).writeAsStringSync(contents);
 }
 
-void main() {
 ''');
 int fallthroughLabelCounter = 0;
   for (var line in source) {
@@ -249,7 +248,7 @@ else {
 }
   }
 
-  dartCode.writeln('}');
+
 
   File(outputDart).writeAsStringSync(dartCode.toString());
 
