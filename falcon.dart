@@ -42,7 +42,9 @@ else if (line.startsWith('readFile(')) {
   final inside = line.substring(9, line.length - 1);
   dartCode.writeln('  File($inside).readAsStringSync();');
 }
-
+else if (line.startsWith("final ")) {
+  dartCode.writeln(line + ";");
+}
 // ===== File IO: writeFile("path", "content")
 else if (line.startsWith('writeFile(')) {
   final args = line.substring(10, line.length - 1).split(',');
