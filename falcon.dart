@@ -29,24 +29,12 @@ int fallthroughLabelCounter = 0;
   for (var line in source) {
     line = line.trim();
 
-    // print with comma concat and interpolation
+    // ===== print with exact Dart syntax
 if (line.startsWith('print(')) {
+  // Take everything inside the parentheses as-is
   var inside = line.substring(6, line.length - 1).trim();
 
-  // Replace commas with + for concatenation
-  inside = inside.replaceAll(',', '+');
-
-  // Handle string interpolation: replace $var with ${var}
-  inside = inside.replaceAllMapped(RegExp(r'\$([a-zA-Z_]\w*)'), (match) {
-    return '\${${match.group(1)}}';
-  });
-
-  // Convert everything after + to string
-  inside = inside.replaceAllMapped(
-    RegExp(r'(\+\s*)(\w+)'),
-    (match) => '${match.group(1)}${match.group(2)}.toString()'
-  );
-
+  // Output exactly as Dart expects
   dartCode.writeln('  print($inside);');
 }
 // ===== File IO: readFile("path")
@@ -77,13 +65,19 @@ else if (line.startsWith('deleteFile(')) {
   dartCode.writeln('  File($inside).deleteSync();');
 }
 
-    // let var = value
-    else if (line.startsWith('let ')) {
-      final parts = line.split(RegExp(r'\s+'));
-      final name = parts[1];
-      final value = parts[3];
-      dartCode.writeln('  var $name = $value;');
-    } 
+    // Assignment with function call
+else if (line.startsWith('let ') || line.startsWith('const ')) {
+  // Split at '='
+  final parts = line.split('=');
+  final name = parts[0].replaceAll(RegExp(r'^(let|const)\s+'), '').trim();
+  final value = parts.sublist(1).join('=').trim(); // keep all = inside function calls
+
+  if (line.startsWith('let ')) {
+    dartCode.writeln('  var $name = $value;');
+  } else {
+    dartCode.writeln('  const $name = $value;');
+  }
+}
     else if (line.startsWith('msleep(')) {
   final inside = line.substring(7, line.length - 1); // value inside ()
   dartCode.writeln('  sleep(Duration(milliseconds: $inside));');
@@ -92,17 +86,7 @@ else if (line.startsWith('deleteFile(')) {
   final inside = line.substring(6, line.length - 1); // get number inside ()
   dartCode.writeln('  sleep(Duration(seconds: $inside));');
 }
-    // const var = value
-    else if (line.startsWith('const ')) {
-      final parts = line.split(RegExp(r'\s+'));
-      final name = parts[1];
-      final value = parts[3];
-      dartCode.writeln('  const $name = $value;');
-    } // while loop
-else if (line.startsWith('while ')) {
-  dartCode.writeln('  $line {');
-}
-
+    
 // do while loop
 else if (line.startsWith('do {')) {
   dartCode.writeln('  do {');
@@ -240,8 +224,11 @@ else if (line.startsWith('default')) {
 else if (line.startsWith('}')) {
   dartCode.writeln('  }');
 }
-else if (line.endsWith(')') && !line.endsWith(';')) {
-  dartCode.writeln('  $line;'); // auto add semicolon
+// If line ends with ')' and is not a control statement
+else if (line.endsWith(')') && !line.endsWith(';') &&
+         !line.startsWith('if') && !line.startsWith('while') &&
+         !line.startsWith('for')) {
+  dartCode.writeln('  $line;'); // keep exactly as-is
 }
 else {
   dartCode.writeln('  $line');
