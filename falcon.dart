@@ -59,6 +59,43 @@ else if (line.startsWith('writeFile(')) {
 else if (line.startsWith('fileExists(')) {
   final inside = line.substring(11, line.length - 1);
   dartCode.writeln('  File($inside).existsSync();');
+}// ===== Standalone input() with variable assignment
+else if (line.startsWith('input(')) {
+  final inside = line.substring(6, line.length - 1); // content inside ()
+  final args = inside.split(',').map((s) => s.trim()).toList();
+
+  if (args.length >= 2) {
+    // args[0] = "int age", args[1] = "Enter your age: "
+    final typeAndName = args[0].split(RegExp(r'\s+'));
+    if (typeAndName.length != 2) {
+      throw Exception("Invalid input() syntax. Use: input(type name, \"prompt\")");
+    }
+
+    final type = typeAndName[0];    // int, str, double, bool
+    final name = typeAndName[1];    // variable name
+    final prompt = args[1];         // "Enter your age: "
+
+    String dartInput;
+    switch (type) {
+      case 'int':
+        dartInput = 'int.parse(stdin.readLineSync()!)';
+        break;
+      case 'double':
+        dartInput = 'double.parse(stdin.readLineSync()!)';
+        break;
+      case 'bool':
+        dartInput = 'stdin.readLineSync()!.toLowerCase() == "true"';
+        break;
+      case 'str':
+      case 'String':
+      default:
+        dartInput = 'stdin.readLineSync()!';
+    }
+
+    // Generate Dart code
+    dartCode.writeln('  stdout.write($prompt);');
+    dartCode.writeln('  var $name = $dartInput;');
+  }
 }
 
 // ===== File IO: deleteFile("path")
