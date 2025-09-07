@@ -27,8 +27,22 @@ void writeFile(String path, String contents) {
 ''');
 int fallthroughLabelCounter = 0;
   for (var line in source) {
-    line = line.trim();
+    // Check for raw block first and handle exclusively
+    if (inRawBlock) {
+      if (line.trim() == '}') {
+        inRawBlock = false;
+        continue; // Correctly discard the closing brace from the output
+      } else {
+        dartCode.writeln('$line'); // Copy raw contents with indentation
+      }
+      continue; // Skip all other checks for lines inside a raw block
+    } else if (line.trim().startsWith('raw {')) {
+      inRawBlock = true;
+      continue; // Discard the 'raw {' line so it doesn't cause a Dart error
+    }
 
+    line = line.trim();
+    
     // ===== print with exact Dart syntax
 if (line.startsWith('print(')) {
   // Take everything inside the parentheses as-is
