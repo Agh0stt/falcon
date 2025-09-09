@@ -9,7 +9,7 @@ void main(List<String> args) {
   final sourceFile = args[0];
   final outputDart = args[1];
   final outputBinary = args[2];
-
+ bool inRawBlock = false;
   final source = File(sourceFile).readAsLinesSync();
 
   final dartCode = StringBuffer('''
