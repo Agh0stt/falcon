@@ -1,5 +1,5 @@
 import 'dart:io';
-// falcon (falconc FalconCompiler) - copyrigjt -: 2025-Present Abhigyan Ghosh. All rights reserved.
+// falcon (falconc FalconCompiler) - copyright -: 2025-Present Abhigyan Ghosh. All rights reserved.
 void main(List<String> args) {
   if (args.length < 3) {
     print("Usage: dart falcon.dart <source.fl> <output.dart>");
@@ -9,7 +9,10 @@ void main(List<String> args) {
   final sourceFile = args[0];
   final outputDart = args[1];
   final outputBinary = args[2];
- bool inRawBlock = false;
+  
+  // Define `inRawBlock` before the loop.
+  bool inRawBlock = false; 
+
   final source = File(sourceFile).readAsLinesSync();
 
   final dartCode = StringBuffer('''
@@ -33,7 +36,7 @@ int fallthroughLabelCounter = 0;
         inRawBlock = false;
         continue; // Correctly discard the closing brace from the output
       } else {
-        dartCode.writeln('$line'); // Copy raw contents with indentation
+        dartCode.writeln('$line'); // Copy raw contents with no indent, it will stay as same as user tyoes
       }
       continue; // Skip all other checks for lines inside a raw block
     } else if (line.trim().startsWith('raw {')) {
@@ -43,12 +46,14 @@ int fallthroughLabelCounter = 0;
 
     line = line.trim();
     
+
     // ===== print with exact Dart syntax
 if (line.startsWith('print(')) {
   // Take everything inside the parentheses as-is
   var inside = line.substring(6, line.length - 1).trim();
 
-  // Output exactly as Dart expects
+  // Output exactly as Dart expects// Only add ; if not already there
+// Output exactly as Dart expects
   dartCode.writeln('  print($inside);');
 }
 // ===== File IO: readFile("path")
@@ -68,7 +73,36 @@ else if (line.startsWith('writeFile(')) {
     dartCode.writeln('  File($path).writeAsStringSync($content);');
   }
 }
+// ===== Include Files (placed after raw block for proper processing)
+    if (line.trim().startsWith('include =')) {
+      final filePathMatch = RegExp(r'include\s*=\s*"([^"]+)"').firstMatch(line);
+      if (filePathMatch != null) {
+        final filePath = filePathMatch.group(1)!;
 
+        // Check for circular includes
+        if (includedFiles.contains(filePath)) {
+          print("Warning: Skipping duplicate include of $filePath");
+          continue;
+        }
+
+        includedFiles.add(filePath);
+
+        try {
+          final includedContent = File(filePath).readAsLinesSync();
+          for (var includedLine in includedContent) {
+            dartCode.writeln(includedLine);
+          }
+        } catch (e) {
+          print("Error: Could not read included file '$filePath': $e");
+          exit(1);
+        }
+      } else {
+        print("Error: Invalid include syntax. Use: include = \"filename.header\"");
+        exit(1);
+      }
+      continue; // Skip the rest of the loop for this line.
+    }
+    
 // ===== File IO: fileExists("path")
 else if (line.startsWith('fileExists(')) {
   final inside = line.substring(11, line.length - 1);
@@ -269,8 +303,6 @@ else if (line.trim() == 'break') {
 else if (line.startsWith('default')) {
   dartCode.writeln('  default:');
 }
-
-
    else if (line.startsWith('if ') || line.startsWith('else if') || line.startsWith('else')) {
   dartCode.writeln('  $line');
 }
@@ -289,8 +321,7 @@ else {
   }
 
 
-
-  File(outputDart).writeAsStringSync(dartCode.toString());
+File(outputDart).writeAsStringSync(dartCode.toString());
 
 
   // Compile Dart to machine code
