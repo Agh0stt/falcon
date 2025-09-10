@@ -306,8 +306,80 @@ else if (line.startsWith('default')) {
    else if (line.startsWith('if ') || line.startsWith('else if') || line.startsWith('else')) {
   dartCode.writeln('  $line');
 }
-else if (line.startsWith('}')) {
-  dartCode.writeln('  }');
+// ===== Classes
+else if (line.startsWith("class ")) {
+  final classMatch = RegExp(r'class\s+(\w+)\s*\{').firstMatch(line);
+  if (classMatch != null) {
+    final className = classMatch.group(1)!;
+    dartCode.writeln("class $className {");
+  }
+}
+// ===== Closing brace inside class
+else if (line.trim() == "}") {
+  dartCode.writeln("}");
+}
+// ===== Functions inside class (must be static)
+else if (RegExp(r'^(static\s+)?(void|int|bool|str|double)\s+\w+\s*\(').hasMatch(line)) {
+  final funcMatch = RegExp(r'^(static\s+)?(void|int|bool|str|double)\s+(\w+)\((.*?)\)')
+      .firstMatch(line);
+
+  if (funcMatch != null) {
+    final staticKeyword = funcMatch.group(1) ?? "";
+    var returnType = funcMatch.group(2)!;
+    final funcName = funcMatch.group(3)!;
+    final params = funcMatch.group(4)!;
+
+    // map Falcon types to Dart
+    switch (returnType) {
+      case "int": returnType = "int"; break;
+      case "bool": returnType = "bool"; break;
+      case "str": returnType = "String"; break;
+      case "double": returnType = "double"; break;
+      case "void": default: returnType = "void";
+    }
+
+    // params typing
+    final typedParams = params.trim().isEmpty
+        ? ""
+        : params.split(",").map((p) {
+            final parts = p.trim().split(RegExp(r'\s+'));
+            if (parts.length != 2) {
+              throw Exception("Invalid parameter in function $funcName. Use: type name");
+            }
+            var type = parts[0];
+            if (type == "str") type = "String";
+            return "$type ${parts[1]}";
+          }).join(", ");
+
+    // enforce static
+    if (!staticKeyword.trim().startsWith("static")) {
+      throw Exception("Error: Functions inside classes must be declared static.");
+    }
+
+    dartCode.writeln("  $staticKeyword$returnType $funcName($typedParams) {");
+  }
+}
+
+// ===== Import Files (blind paste)
+else if (line.trim().startsWith('import ')) {
+  final filePathMatch = RegExp(r'import\s+"([^"]+)"').firstMatch(line);
+  if (filePathMatch != null) {
+    final filePath = filePathMatch.group(1)!;
+
+    try {
+      final importedContent = File(filePath).readAsLinesSync();
+      for (var importedLine in importedContent) {
+        dartCode.writeln(importedLine);
+      }
+    } catch (e) {
+      print("Error: Could not read imported file '$filePath': $e");
+      exit(1);
+    }
+  } else {
+    print("Error: Invalid import syntax. Use: import \"filename.fl\"");
+    exit(1);
+  }
+  continue; // Skip processing this line further
 }
 // If line ends with ')' and is not a control statement
 else if (line.endsWith(')') && !line.endsWith(';') &&
