@@ -1,0 +1,114 @@
+class std {
+static void println(str args) {
+	raw {
+		stdout.writeln(args);
+	}
+}
+
+static void printErr(str args) {
+	raw {
+		stderr.writeln(args);
+	}
+}
+
+static str readString(str prompt) {
+	raw {
+		stdout.write(prompt);
+		return stdin.readLineSync()!;
+	}
+}
+
+// Reads a single line from the user and converts it to an integer.
+// Displays a prompt before reading.
+static int readInt(str prompt) {
+	raw {
+		stdout.write(prompt);
+		return int.parse(stdin.readLineSync()!);
+	}
+}
+
+// Reads a single line from the user and converts it to a double.
+// Displays a prompt before reading.
+static double readDouble(str prompt) {
+	raw {
+		stdout.write(prompt);
+		return double.parse(stdin.readLineSync()!);
+	}
+}
+
+// Reads the content of a file as a single string.
+// Returns an empty string on error.
+static str readFile(str filePath) {
+	raw {
+		try {
+			return File(filePath).readAsStringSync();
+		} catch (e) {
+			stderr.writeln('Error: Could not read file $filePath. $e');
+			return '';
+		}
+	}
+}
+
+// Writes content to a file. Overwrites the file if it already exists.
+static void writeFile(str filePath, str content) {
+	raw {
+		try {
+			File(filePath).writeAsStringSync(content);
+		} catch (e) {
+			stderr.writeln('Error: Could not write to file $filePath. $e');
+		}
+	}
+}
+
+// Appends content to the end of a file.
+// Creates the file if it does not exist.
+static void appendFile(str filePath, str content) {
+	raw {
+		try {
+			File(filePath).writeAsStringSync(content, mode: FileMode.append);
+		} catch (e) {
+			stderr.writeln('Error: Could not append to file $filePath. $e');
+		}
+	}
+}
+
+// Opens and returns a File object reference.
+// This is not strictly necessary for simple read/write operations,
+// but can be useful for more advanced file handling.
+// It is recommended to use the simpler functions above.
+static void openFile(str filePath) {
+    raw {
+        File(filePath);
+    }
+}
+
+// Deletes a file at the specified path.
+static void deleteFile(str filePath) {
+	raw {
+		try {
+			File(filePath).deleteSync();
+		} catch (e) {
+			stderr.writeln('Error: Could not delete file $filePath. $e');
+		}
+	}
+}
+
+// Checks if a file exists and returns a boolean.
+static bool fileExists(str filePath) {
+	raw {
+		return File(filePath).existsSync();
+	}
+}
+
+// Creates a directory (and any necessary parent directories) at the specified path.
+static void createDirectory(str dirPath) {
+	raw {
+		try {
+			Directory(dirPath).createSync(recursive: true);
+		} catch (e) {
+			stderr.writeln('Error: Could not create directory $dirPath. $e');
+		}
+	}
+}
+
+}
