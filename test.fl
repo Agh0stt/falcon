@@ -1,4 +1,5 @@
-func sayHello() {
-  print("Hello")
+incl = "include/std.fl"
+
+void main() {
+   std.println("hello")
 }
-sayHello()
