@@ -111,4 +111,16 @@ static void createDirectory(str dirPath) {
 	}
 }
 
+static str toUpper(str s) {
+  return s.toUpperCase()
+}
+
+static str toLower(str s) {
+  return s.toLowerCase()
+}
+
+static int length(str s) {
+  return s.length
+}
+
 }
