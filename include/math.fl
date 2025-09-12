@@ -1,0 +1,97 @@
+class Maths {
+  // ===== Absolute values =====
+  static int absInt(int x) {
+    raw {
+      return x.abs();
+    }
+  }
+
+  static double absDouble(double x) {
+    raw {
+      return x.abs();
+    }
+  }
+
+  // ===== Roots & Powers =====
+  static double sqrt(double x) {
+    raw {
+      return sqrt(x);
+    }
+  }
+
+  static double cbrt(double x) {
+    raw {
+      return pow(x, 1/3).toDouble();  // force to double
+    }
+  }
+
+  static num pow(num x, num y) {
+    raw {
+      return pow(x, y);  //  keep as num
+    }
+  }
+
+  // ===== Rounding =====
+  static int floor(double x) {
+    raw {
+      return x.floor();
+    }
+  }
+
+  static int ceil(double x) {
+    raw {
+      return x.ceil();
+    }
+  }
+
+  static int round(double x) {
+    raw {
+      return x.round();
+    }
+  }
+
+  // ===== Trigonometry =====
+  static double sin(double x) {
+    raw {
+      return sin(x);
+    }
+  }
+
+  static double cos(double x) {
+    raw {
+      return cos(x);
+    }
+  }
+
+  static double tan(double x) {
+    raw {
+      return tan(x);
+    }
+  }
+
+  // ===== Logs & Exp =====
+  static double log(double x) {
+    raw {
+      return log(x);
+    }
+  }
+
+  static double exp(double x) {
+    raw {
+      return exp(x);
+    }
+  }
+
+  // ===== Min / Max =====
+  static num max(num a, num b) {
+    raw {
+      return max(a, b);
+    }
+  }
+
+  static num min(num a, num b) {
+    raw {
+      return min(a, b);
+    }
+  }
+}
