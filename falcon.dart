@@ -58,6 +58,7 @@ void main(List<String> args) {
   // Begin the Dart code generation
   final dartCode = StringBuffer('''
 import 'dart:io';
+import 'dart:math';
 
 // Falcon Standard Library (auto added)
 String readFile(String path) {
