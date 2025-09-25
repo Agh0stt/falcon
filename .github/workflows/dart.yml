@@ -14,11 +14,11 @@ jobs:
         arch: [x64, x86]
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Dart SDK
-        uses: dart-lang/setup-dart@v1
+        uses: dart-lang/setup-dart@v2
         with:
           sdk: stable
 
@@ -28,14 +28,14 @@ jobs:
       - name: Compile Falcon Dart
         run: |
           echo "Compiling falcon.dart for ${{ matrix.os }}-${{ matrix.arch }}..."
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             dart compile exe falcon/falcon.dart -o build/falcon-${{ matrix.os }}-${{ matrix.arch }}.exe
           else
             dart compile exe falcon/falcon.dart -o build/falcon-${{ matrix.os }}-${{ matrix.arch }}
           fi
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Upload compiled binaries
+        uses: actions/upload-artifact@v4
         with:
           name: falcon-binaries-${{ matrix.os }}-${{ matrix.arch }}
           path: build/
