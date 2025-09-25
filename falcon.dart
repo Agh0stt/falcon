@@ -311,11 +311,6 @@ void writeFile(String path, String contents) {
       }
     }
     
-    else if (trimmedLine.startsWith('switch ')) {
-      final expr = trimmedLine.substring(7, trimmedLine.length - 1).trim();
-      dartCode.writeln('switch ($expr) {');
-    }
-    
         else if (trimmedLine.startsWith('switch ')) {
       final expr = trimmedLine.substring(7, trimmedLine.length - 1).trim();
       dartCode.writeln('switch ($expr) {');
