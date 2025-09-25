@@ -386,16 +386,7 @@ void writeFile(String path, String contents) {
         }
         dartCode.writeln("  $staticKeyword$returnType $funcName($typedParams) {");
       }
-      // Variable declarations (int, double, bool, str/String)
-    else if (RegExp(r'^(int|double|bool|str|String)\s+\w+\s*=').hasMatch(trimmedLine)) {
-      var processedLine = trimmedLine;
-      // Convert 'str' to 'String' for Dart compatibility
-      if (processedLine.startsWith('str ')) {
-        processedLine = processedLine.replaceFirst('str ', 'String ');
-      }
-      dartCode.writeln('  $processedLine;');
-    }
-    }
+    
     // If line ends with ')' and is not a control statement
     else if (trimmedLine.endsWith(')') && !trimmedLine.endsWith(';') &&
              !trimmedLine.startsWith('if') && !trimmedLine.startsWith('while') &&
