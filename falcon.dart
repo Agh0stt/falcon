@@ -315,11 +315,18 @@ void writeFile(String path, String contents) {
       final expr = trimmedLine.substring(7, trimmedLine.length - 1).trim();
       dartCode.writeln('switch ($expr) {');
     }
+    
+        else if (trimmedLine.startsWith('switch ')) {
+      final expr = trimmedLine.substring(7, trimmedLine.length - 1).trim();
+      dartCode.writeln('switch ($expr) {');
+    }
     else if (trimmedLine.startsWith('case ')) {
       final value = trimmedLine.substring(5).trim();
+      // Remove trailing colon if present to avoid double colons
+      final cleanValue = value.endsWith(':') ? value.substring(0, value.length - 1) : value;
       final label = 'label${fallthroughLabelCounter++}';
       dartCode.writeln('$label:');
-      dartCode.writeln('  case $value:');
+      dartCode.writeln('  case $cleanValue:');
     }
     else if (trimmedLine == 'fallthrough') {
       final nextLabel = 'label${fallthroughLabelCounter}';
@@ -379,6 +386,15 @@ void writeFile(String path, String contents) {
         }
         dartCode.writeln("  $staticKeyword$returnType $funcName($typedParams) {");
       }
+      // Variable declarations (int, double, bool, str/String)
+    else if (RegExp(r'^(int|double|bool|str|String)\s+\w+\s*=').hasMatch(trimmedLine)) {
+      var processedLine = trimmedLine;
+      // Convert 'str' to 'String' for Dart compatibility
+      if (processedLine.startsWith('str ')) {
+        processedLine = processedLine.replaceFirst('str ', 'String ');
+      }
+      dartCode.writeln('  $processedLine;');
+    }
     }
     // If line ends with ')' and is not a control statement
     else if (trimmedLine.endsWith(')') && !trimmedLine.endsWith(';') &&
@@ -390,7 +406,7 @@ void writeFile(String path, String contents) {
       dartCode.writeln('  $trimmedLine');
     }
   }
-
+ 
   // Finalize and write the output
   File(outputDart).writeAsStringSync(dartCode.toString());
   final result = Process.runSync('dart', ['compile', 'exe', outputDart, '-o', outputBinary]);
