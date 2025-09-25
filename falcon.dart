@@ -397,6 +397,7 @@ void writeFile(String path, String contents) {
       dartCode.writeln('  $trimmedLine');
     }
   }
+  }
  
   // Finalize and write the output
   File(outputDart).writeAsStringSync(dartCode.toString());
