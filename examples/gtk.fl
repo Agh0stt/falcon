@@ -1,0 +1,23 @@
+void main() {
+  raw {
+    const pythonCode = r"""
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+
+class HelloWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Falcon GUI")
+        self.set_default_size(300, 100)
+        label = Gtk.Label(label="Hello from Falcon!")
+        self.add(label)
+
+win = HelloWindow()
+win.connect("destroy", Gtk.main_quit)
+win.show_all()
+Gtk.main()
+""";
+
+    Process.runSync("python3", ["-c", pythonCode]);
+  }
+}
