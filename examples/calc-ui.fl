@@ -1,0 +1,72 @@
+void main() {
+raw {
+const pyCode = r'''
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+
+class Calculator(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Falcon Calculator")
+        self.set_default_size(250, 300)
+        self.set_border_width(10)
+
+        # Create a vertical layout
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add(vbox)
+
+        # Entry display
+        self.display = Gtk.Entry()
+        self.display.set_editable(False)
+        vbox.pack_start(self.display, False, False, 0)
+
+        # Button layout
+        buttons = [
+            ["7", "8", "9", "/"],
+            ["4", "5", "6", "*"],
+            ["1", "2", "3", "-"],
+            ["0", ".", "=", "+"],
+        ]
+
+        for row in buttons:
+            hbox = Gtk.Box(spacing=6)
+            for label in row:
+                button = Gtk.Button(label=label)
+                button.connect("clicked", self.on_button_clicked)
+                hbox.pack_start(button, True, True, 0)
+            vbox.pack_start(hbox, True, True, 0)
+
+        # Clear button
+        clear_btn = Gtk.Button(label="C")
+        clear_btn.connect("clicked", self.on_clear)
+        vbox.pack_start(clear_btn, False, False, 0)
+
+    def on_button_clicked(self, button):
+        label = button.get_label()
+        text = self.display.get_text()
+
+        if label == "=":
+            try:
+                result = str(eval(text))
+                self.display.set_text(result)
+            except Exception:
+                self.display.set_text("Error")
+        else:
+            self.display.set_text(text + label)
+
+    def on_clear(self, button):
+        self.display.set_text("")
+
+def main():
+    win = Calculator()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+
+if __name__ == "__main__":
+    main()
+''';
+Process.runSync('python3', ['-c', pyCode]);
+
+ }
+}
