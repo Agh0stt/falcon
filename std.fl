@@ -1,0 +1,82 @@
+# std.fl — Falcon Standard Library
+# Thin wrappers over the _flr_* symbols in flr.o / flr.s.
+# Import with:  import "std"
+#
+# After import the compiler sets has_std=1 and inlines the runtime
+# (or links against flr.o when built separately).
+#
+# Available functions (all map 1-to-1 to _flr_* symbols):
+
+# ── I/O ──────────────────────────────────────────────────────────────
+
+func print_str(s: str) -> void {
+    # Implemented by the compiler as a direct call to _flr_print_str.
+    # The compiler's N_EXPRSTMT / print special-case handles `print(s)`
+    # when the argument is a str type; this wrapper exists so user code
+    # can also call print_str() explicitly.
+    __syscall(4, 1, s, str_len(s))  # sys_write fd=1 buf=s len
+    # newline is NOT appended here — use print() which calls _flr_print_str
+}
+
+func print_int(n: int) -> void {
+    # Delegates to the runtime's digit-conversion + write path.
+    # The compiler already knows to call _flr_print_int for print(int),
+    # so this function is here for explicit calls.
+    __syscall(4, 1, int_to_str(n), str_len(int_to_str(n)))
+}
+
+# ── String utilities ──────────────────────────────────────────────────
+
+func str_len(s: str) -> int {
+    return _flr_str_len(s)
+}
+
+func str_eq(a: str, b: str) -> int {
+    return _flr_str_eq(a, b)
+}
+
+func int_to_str(n: int) -> str {
+    return _flr_int_to_str(n)
+}
+
+func str_to_int(s: str) -> int {
+    return _flr_str_to_int(s)
+}
+
+# ── Math ──────────────────────────────────────────────────────────────
+
+func abs(n: int) -> int {
+    return _flr_abs(n)
+}
+
+func min(a: int, b: int) -> int {
+    return _flr_min(a, b)
+}
+
+func max(a: int, b: int) -> int {
+    return _flr_max(a, b)
+}
+
+# ── Memory ────────────────────────────────────────────────────────────
+
+func alloc(size: int) -> int {
+    # Returns a pointer (int) to size bytes of zero-initialised heap memory.
+    # Uses the 1 MB bump allocator in flr.o; there is no free().
+    return _flr_alloc(size)
+}
+
+func free(ptr: int) -> void {
+    # No-op in the bump allocator. Provided so code is portable.
+    _flr_free(ptr)
+}
+
+# ── Control ───────────────────────────────────────────────────────────
+
+func exit(code: int) -> void {
+    _flr_exit(code)
+}
+
+func assert(cond: int, msg: str) -> void {
+    # If cond == 0 prints "assertion failed: <msg>" to stderr and exits(1).
+    _flr_assert(cond, msg)
+}
