@@ -425,6 +425,9 @@ static int types_compat(TypeRef *a,TypeRef *b){
     if(a->kind==TY_STRUCT&&(b->kind==TY_INT||b->kind==TY_PTR))return 1;
     /* ptr <-> int interchangeable */
     if((a->kind==TY_PTR||a->kind==TY_INT)&&(b->kind==TY_PTR||b->kind==TY_INT))return 1;
+    /* str <-> int/ptr: str is just a char pointer, allow for bare-metal */
+    if((a->kind==TY_STR)&&(b->kind==TY_INT||b->kind==TY_PTR))return 1;
+    if((b->kind==TY_STR)&&(a->kind==TY_INT||a->kind==TY_PTR))return 1;
     return 0;
 }
 
@@ -1814,7 +1817,7 @@ static void gen_stmt(Node *n){
 }
 
 static void gen_func(Node *fn){
-    nvars=0;frame_sz=0;lbl_cnt=0;
+    nvars=0;frame_sz=0;/* lbl_cnt is global, not reset per function */
     memset(break_lbl,0,sizeof break_lbl);memset(cont_lbl,0,sizeof cont_lbl);
     for(int i=0;i<fn->params.n;i++){
         Var *v=&vars[nvars++];
