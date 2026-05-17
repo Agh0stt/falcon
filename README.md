@@ -4,6 +4,23 @@ Falcon is a small compiled language that targets x86-32 Linux. It has a C-like f
 
 ---
 
+## What's new
+
+### v3
+- **`float`** — 32-bit IEEE-754 via x87 FPU (`flds`/`fstps`/`fadd` etc.)
+- **`double`** — 64-bit IEEE-754 via x87 FPU (`fldl`/`fstpl`/`faddp` etc.)
+- **`let`** — mutable variable declaration (sugar: `let x: int = 5`)
+- **`const`** — immutable compile-time constant, folded at compile time, no stack slot (`const PI: float = 3.14`, `const MAX: int = 100`)
+
+### v2
+- **`long`** — 64-bit signed integer (stored as two 32-bit stack slots; arithmetic via 64-bit helpers)
+- **Type checker** — every expression has a computed type; mismatches are errors at compile time, not silent wrong code at runtime
+- **`str_concat(a, b)`** — heap-allocate and concatenate two strings
+- **`str_format(fmt, ...)`** — `%`-style formatting (`%d %s %%`) supporting up to 8 args
+- **Dynamic heap** — `_flr_alloc` uses `brk`/`sbrk` instead of a fixed BSS slab; grows on demand with no hard cap
+
+---
+
 ## Getting started
 
 ```bash
@@ -43,6 +60,9 @@ make clean
 | Type | Description |
 |------|-------------|
 | `int` | 32-bit signed integer |
+| `long` | 64-bit signed integer (stored as two 32-bit slots) |
+| `float` | 32-bit IEEE-754 floating point (x87) |
+| `double` | 64-bit IEEE-754 floating point (x87) |
 | `str` | Pointer to a null-terminated string |
 | `bool` | Boolean (`true` / `false`, stored as 0/1) |
 | `void` | No value, only valid as a function return type |
@@ -55,12 +75,19 @@ make clean
 ```falcon
 name: type
 name: type = expression
+let name: type = expression    # same as above; emphasises mutability
+const name: type = expression  # compile-time constant; cannot be reassigned
 ```
 
 ```falcon
 x: int = 42
 greeting: str = "hello"
 flag: bool = true
+big: long = 1234567890L
+pi: float = 3.14
+ratio: double = 1.6180339887
+let count: int = 0
+const MAX: int = 100
 ```
 
 ### Functions
@@ -81,7 +108,7 @@ func greet(s: str) -> void {
 }
 ```
 
-A `main` function is required. It must be `-> void` (or just `-> void` returning nothing). The runtime calls it from `_start` and passes its return value to `sys_exit`.
+A `main` function is required. It must return `-> void`. The runtime calls it from `_start` and passes its return value to `sys_exit`.
 
 ### Arithmetic
 
@@ -89,7 +116,7 @@ A `main` function is required. It must be `-> void` (or just `-> void` returning
 a + b    a - b    a * b    a / b    a % b
 ```
 
-All operations are 32-bit signed integer arithmetic.
+Integer operations are 32-bit signed. `long` operands use 64-bit helpers. `float`/`double` operands use x87 FPU instructions.
 
 ### Comparison
 
@@ -97,7 +124,7 @@ All operations are 32-bit signed integer arithmetic.
 a == b    a != b    a < b    a > b    a <= b    a >= b
 ```
 
-Return `1` (true) or `0` (false).
+Return `1` (true) or `0` (false). Works for `int`, `long`, `float`, and `double`.
 
 ### Logical
 
@@ -113,7 +140,7 @@ Short-circuits are not guaranteed — both sides may be evaluated.
 a & b    a | b    a ^ b    ~a    a << b    a >> b
 ```
 
-Right shift is arithmetic (sign-extending).
+Right shift is arithmetic (sign-extending). Bitwise operators require numeric operands.
 
 ### Compound assignment
 
@@ -200,9 +227,18 @@ Struct variables hold a pointer. You must allocate memory before writing to any 
 42        # decimal
 0xFF      # hexadecimal
 0xDEAD
+1234L     # long (L suffix optional for long variables)
 ```
 
 Binary literals (`0b...`) are not supported — use hex or decimal.
+
+### Float / double literals
+
+```falcon
+3.14f     # float  (f suffix)
+3.14      # double (no suffix, or d suffix)
+2.718e0   # scientific notation
+```
 
 ### String literals
 
@@ -234,6 +270,43 @@ Use `-I<path>` to add directories to the search path. Imports are recursive and 
 
 ---
 
+## Type checker
+
+Falcon performs a full type check pass between parsing and code generation. Every expression node is annotated with its computed type; mismatches produce a compile-time error with file and line number.
+
+**What the type checker catches:**
+
+- Undefined variables
+- Wrong number of arguments to a function
+- Argument type mismatches for user-defined functions
+- Return type mismatches
+- Arithmetic or bitwise operators applied to non-numeric types
+- Assignments to `const` variables
+- Invalid compound assignments (e.g. `+=` on a non-numeric left-hand side)
+- Indexing a non-array type
+- Using a non-numeric array index
+- Accessing a field that doesn't exist on a struct
+- Mixed-type array literals
+- `break` or `continue` outside a loop
+- `str_concat` called with non-`str` arguments
+- `str_format` called with a non-`str` format argument or more than 8 format args
+
+**Type widening rules:**
+
+| From | To | Allowed |
+|------|----|---------|
+| `int` | `long` | yes |
+| `long` | `int` | yes |
+| `int`/`long` | `float`/`double` | yes |
+| `float` | `double` | yes |
+| `bool` | `int` | yes |
+| `int`/`*T` | `str` | yes (bare-metal pointer use) |
+| `int` | struct variable | yes (`_flr_alloc` return) |
+
+Unknown external functions produce a warning and are assumed to return `void`.
+
+---
+
 ## Standard library (`import "std"`)
 
 Importing `"std"` enables the `print()` built-in and links the Falcon runtime functions. No file is needed on disk — `std` is a virtual import.
@@ -243,9 +316,12 @@ Importing `"std"` enables the `print()` built-in and links the Falcon runtime fu
 ```falcon
 print(42)          # prints an integer followed by a newline
 print("hello")     # prints a string followed by a newline
+print(3.14f)       # prints a float followed by a newline
+print(3.14)        # prints a double followed by a newline
+print(1234567890L) # prints a long followed by a newline
 ```
 
-`print` automatically picks `_flr_print_int` or `_flr_print_str` based on the type of its argument.
+`print` automatically dispatches to the correct runtime function based on the type of its argument.
 
 ### Runtime functions
 
@@ -260,10 +336,12 @@ These are always available after `import "std"`. Call them directly by name.
 | `_flr_abs(n)` | Absolute value |
 | `_flr_min(a, b)` | Smaller of two integers |
 | `_flr_max(a, b)` | Larger of two integers |
-| `_flr_alloc(n)` | Allocate `n` bytes from the bump heap, returns pointer |
+| `_flr_alloc(n)` | Allocate `n` bytes from the dynamic heap, returns pointer |
 | `_flr_free(ptr)` | No-op (bump allocator has no free) |
 | `_flr_exit(code)` | Exit with status code |
 | `_flr_assert(cond, msg)` | Abort with message if `cond` is 0 |
+| `str_concat(a, b)` | Heap-allocate and return concatenation of two strings |
+| `str_format(fmt, ...)` | Printf-style formatting; supports `%d`, `%s`, `%%`; up to 8 args |
 
 ---
 
@@ -315,7 +393,7 @@ as --32 out.s -o out.o
 ld -m elf_i386 -T link.ld out.o -o kernel.elf
 ```
 
-`flr.o` provides `_start`, all `_flr_*` symbols, and the 1 MB bump heap. It must come before user object files on the linker command line.
+`flr.o` provides `_start`, all `_flr_*` symbols, and the dynamic heap. It must come before user object files on the linker command line.
 
 ---
 
@@ -369,7 +447,7 @@ done
 - **32-bit only.** Targets i386; no x86-64 backend.
 - **No binary literals.** Use decimal or `0x` hex instead.
 - **Structs need manual allocation.** Declare `p: MyStruct = _flr_alloc(nfields * 4)` before writing fields.
-- **int_to_str uses a static buffer.** The returned pointer is overwritten on the next call.
-- **No type checker.** The compiler trusts you. Wrong types produce wrong code silently.
-- **No closures, no generics, no modules beyond import.**
-- **1 MB heap, no free.** The bump allocator never reclaims memory.
+- **`int_to_str` uses a static buffer.** The returned pointer is overwritten on the next call.
+- **No closures, generics, or modules beyond import.**
+- **`str_format` output is capped at 512 bytes.**
+- **No free.** The bump allocator never reclaims memory.
