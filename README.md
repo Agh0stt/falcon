@@ -1,10 +1,21 @@
 # Falcon
 
-Falcon is a small compiled language that targets x86-32 Linux. It has a C-like feel but cleaner syntax — no semicolons, significant newlines, and Python-style `and`/`or`/`not`. The whole toolchain is a single C file (`falconc.c`) plus a pure-assembly runtime (`flr.s`). No libc, no LLVM, no external dependencies.
+Falcon is a small compiled language targeting x86 Linux. It has a C-like feel but cleaner syntax — no semicolons, significant newlines, and Python-style `and`/`or`/`not`. The whole toolchain is a single C file (`falconc.c`) plus a pure-assembly runtime (`flr.s`). No libc, no LLVM, no external dependencies.
 
 ---
 
 ## What's new
+
+### v5
+- **`typedef`** — C-style type aliases with full support for three forms:
+  - `typedef int myint` — primitive or any type alias
+  - `typedef Point Vec2` — struct alias (field access works transparently)
+  - `typedef struct { ... } Name` — inline anonymous struct definition
+  - `typedef struct Tag { ... } Alias` — tagged inline struct (C-style)
+
+### v4
+- **`-arch x86-64-linux`** — new 64-bit target (System V AMD64 ABI): `syscall` instead of `int 0x80`, args in `rdi/rsi/rdx/rcx/r8/r9`, native 64-bit `long`, SSE2 for float/double
+- **`-arch x86-32-linux`** — explicit flag for the original 32-bit target (still the default)
 
 ### v3
 - **`float`** — 32-bit IEEE-754 via x87 FPU (`flds`/`fstps`/`fadd` etc.)
@@ -51,6 +62,15 @@ make run F=hello.fl     # compile, link, and run in one step
 make clean
 ```
 
+To target 64-bit:
+
+```bash
+./falconc hello.fl -arch x86-64-linux -o hello.s
+as hello.s -o hello.o
+ld hello.o -o hello
+./hello
+```
+
 ---
 
 ## Language reference
@@ -69,6 +89,7 @@ make clean
 | `[T]` | Array of T (heap-allocated, 0-indexed) |
 | `*T` | Pointer to T |
 | `Name` | User-defined struct |
+| `Alias` | Typedef alias (resolves to the underlying type) |
 
 ### Variable declaration
 
@@ -220,6 +241,37 @@ func main() -> void {
 ```
 
 Struct variables hold a pointer. You must allocate memory before writing to any field (`nfields × 4` bytes).
+
+### Typedef
+
+Type aliases let you give a new name to any existing type.
+
+```falcon
+# Primitive alias
+typedef int   Number
+typedef str   Text
+
+# Struct alias — Vec2 is fully usable with .x .y fields
+struct Point { x: int  y: int }
+typedef Point Vec2
+
+# Inline struct (no separate struct declaration needed)
+typedef struct {
+    r: int
+    g: int
+    b: int
+} Color
+
+# Tagged inline struct (C-style)
+typedef struct Rect {
+    x: int
+    y: int
+    w: int
+    h: int
+} Rectangle
+```
+
+Aliases resolve recursively, work in variable declarations, function parameters, and return types, and are fully visible to the type checker.
 
 ### Integer literals
 
@@ -381,12 +433,26 @@ In freestanding mode `import "std"` and all `_flr_*` functions are unavailable. 
 
 ---
 
+## Compiler flags
+
+| Flag | Description |
+|------|-------------|
+| `-o <file>` | Write assembly output to `<file>` instead of stdout |
+| `-arch x86-32-linux` | Target 32-bit Linux, cdecl, `int 0x80` syscalls (default) |
+| `-arch x86-64-linux` | Target 64-bit Linux, System V AMD64 ABI, `syscall` |
+| `--freestanding` | No runtime, no `sys_exit`; `main` falls through to `hlt` loop |
+| `-I<path>` | Add `<path>` to the import search path |
+
 ## Linking
 
 ```bash
-# hosted (the normal case)
+# 32-bit hosted (the normal case)
 as --32 out.s -o out.o
-ld -m elf_i386 flr.o out.o -o prog
+ld -m elf_i386 --allow-multiple-definition flr.o out.o -o prog
+
+# 64-bit hosted
+as out.s -o out.o
+ld out.o -o prog
 
 # freestanding (OS kernel, bootloader, etc.)
 as --32 out.s -o out.o
@@ -429,14 +495,21 @@ The `examples/` folder has one file per language feature, numbered in order.
 | `24_rdtsc.fl` | CPU timestamp counter |
 | `25_assert.fl` | Assertions |
 | `26_comments.fl` | Comment syntax |
+| `27_typedef.fl` | Type aliases (`typedef`) |
 
 Run all of them at once:
+
+```bash
+bash test.sh
+```
+
+Or manually:
 
 ```bash
 for f in examples/*.fl; do
     echo "=== $f ==="
     ./falconc "$f" -o /tmp/t.s && as --32 /tmp/t.s -o /tmp/t.o && \
-    ld -m elf_i386 flr.o /tmp/t.o -o /tmp/t && /tmp/t
+    ld -m elf_i386 --allow-multiple-definition flr.o /tmp/t.o -o /tmp/t && /tmp/t
 done
 ```
 
@@ -444,9 +517,8 @@ done
 
 ## Known limitations
 
-- **32-bit only.** Targets i386; no x86-64 backend.
 - **No binary literals.** Use decimal or `0x` hex instead.
-- **Structs need manual allocation.** Declare `p: MyStruct = _flr_alloc(nfields * 4)` before writing fields.
+- **Structs need manual allocation.** Declare `p: MyStruct = _flr_alloc(nfields * 4)` before writing fields (32-bit: 4 bytes/field; 64-bit: 8 bytes/field).
 - **`int_to_str` uses a static buffer.** The returned pointer is overwritten on the next call.
 - **No closures, generics, or modules beyond import.**
 - **`str_format` output is capped at 512 bytes.**
