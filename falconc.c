@@ -1860,6 +1860,13 @@ static void gen_func(Node *fn){
 static void emit_runtime(void){
     if(!has_std||freestanding)return;
     out("# ── Falcon Runtime (inline) ───────────────────────────\n");
+    /* ELF entry point */
+    out(".globl _start\n_start:\n");
+    out("    xorl %%ebp,%%ebp\n");
+    out("    call main\n");
+    out("    movl %%eax,%%ebx\n");
+    out("    movl $1,%%eax\n");
+    out("    int $0x80\n\n");
 
     /* memset / memcpy */
     out("_flr_memset:\n    pushl %%ebp\n    movl %%esp,%%ebp\n    pushl %%edi\n");
