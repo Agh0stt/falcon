@@ -1,5 +1,14 @@
 /*
- * falconc — Falcon language compiler  (v3)
+ * falconc — Falcon language compiler  (v4)
+ *
+ * New in v4:
+ *   -arch x86-32-linux  — original 32-bit target (default, unchanged)
+ *   -arch x86-64-linux  — new 64-bit target (System V AMD64 ABI)
+ *                         • syscall instead of int 0x80
+ *                         • args in rdi,rsi,rdx,rcx,r8,r9
+ *                         • long is a native 64-bit register (rax)
+ *                         • all stack slots 8 bytes
+ *                         • SSE2 for float/double (xmm0)
  *
  * New in v3:
  *   float         — 32-bit IEEE-754 via x87 FPU (flds/fstps/fadd etc.)
@@ -9,30 +18,27 @@
  *                   const PI: float = 3.14   const MAX: int = 100
  *
  * New in v2:
- *   long          — 64-bit signed integer (stored as two 32-bit stack slots,
- *                   value lives in edx:eax; arithmetic via 64-bit helpers)
+ *   long          — 64-bit signed integer
  *   Type checker  — every expression has a computed type; mismatches are
  *                   errors at compile time, not silent wrong-code at runtime
  *   str_concat(a,b) -> str   — heap-allocate and concatenate two strings
  *   str_format(fmt, ...) -> str  — %-style formatting (%d %s %%) up to 8 args
- *   Dynamic heap  — _flr_alloc uses brk/sbrk instead of a fixed BSS slab;
- *                   starts at program break, grows on demand (no hard cap)
+ *   Dynamic heap  — _flr_alloc uses brk/sbrk (32-bit) or mmap (64-bit)
  *
  * Unchanged from v1:
  *   Lexer, parser structure, all operators, hardware intrinsics,
  *   freestanding mode, import system, arrays, structs, bool, break/continue
  *
- * Syntax extensions:
- *   x: long = 1234567890L    # L suffix optional; plain int literal also ok
- *   s: str = str_concat("hello ", "world")
- *   s: str = str_format("x=%d name=%s", x, name)
- *
  * Build:
  *   gcc -O2 -o falconc falconc.c
  *
- * Linking (hosted):
+ * Linking (32-bit hosted):
  *   as --32 out.s -o out.o
  *   ld -m elf_i386 flr.o out.o -o prog
+ *
+ * Linking (64-bit hosted):
+ *   as out.s -o out.o
+ *   ld out.o -o prog
  */
 
 #include <stdio.h>
@@ -128,7 +134,7 @@ typedef enum{
     TT_AND,TT_OR,TT_NOT,
     TT_TRUE,TT_FALSE,
     TT_BREAK,TT_CONTINUE,
-    TT_STRUCT,TT_IMPORT,
+    TT_STRUCT,TT_IMPORT,TT_TYPEDEF,
     TT_LBRACE,TT_RBRACE,
     TT_LPAREN,TT_RPAREN,
     TT_LBRACKET,TT_RBRACKET,
@@ -161,7 +167,7 @@ static const KW kws[]={
     {"and",TT_AND},{"or",TT_OR},{"not",TT_NOT},
     {"true",TT_TRUE},{"false",TT_FALSE},
     {"break",TT_BREAK},{"continue",TT_CONTINUE},
-    {"struct",TT_STRUCT},{"import",TT_IMPORT},
+    {"struct",TT_STRUCT},{"import",TT_IMPORT},{"typedef",TT_TYPEDEF},
     {NULL,0}
 };
 
@@ -498,6 +504,9 @@ static Node *mknode(NK k,int line){
 
 static Node *parse_expr(void);
 static NList parse_block(void);
+/* forward declarations for typedef registry (defined after struct registry) */
+static void register_typedef(const char *alias,TypeRef *t);
+static TypeRef *resolve_typedef(const char *name);
 
 static TypeRef *parse_type(void){
     skip_nl();Token *t=peek();
@@ -515,7 +524,12 @@ static TypeRef *parse_type(void){
         case TT_STR:   return mktype(TY_STR,NULL,NULL);
         case TT_BOOL: return mktype(TY_BOOL,NULL,NULL);
         case TT_VOID: return mktype(TY_VOID,NULL,NULL);
-        case TT_IDENT:return mktype(TY_STRUCT,t->val,NULL);
+        case TT_IDENT:{
+            /* check typedef registry first, then fall back to struct name */
+            TypeRef *aliased=resolve_typedef(t->val);
+            if(aliased)return aliased;
+            return mktype(TY_STRUCT,t->val,NULL);
+        }
         default:die("%s:%d: expected type, got '%s'",t->file,t->line,t->val);
     }
     return NULL;
@@ -771,12 +785,91 @@ static Node *parse_struct(void){
     expect(TT_RBRACE,"}");return n;
 }
 
+/* ── parse_typedef ──────────────────────────────────────────────────────
+   Three C-style forms supported:
+     typedef int           myint           -- primitive / any type alias
+     typedef ExistingName  NewName         -- struct or type alias
+     typedef struct { f:t ... } Name       -- anonymous inline struct + alias
+     typedef struct Tag { f:t ... } Name   -- tagged inline struct + alias
+   ─────────────────────────────────────────────────────────────────────── */
+static Node *parse_typedef(void){
+    Token *tt=expect(TT_TYPEDEF,"typedef");
+    int ln=tt->line;
+    skip_nl();
+
+    /* Form 3: typedef struct { ... } Name */
+    if(check(TT_STRUCT)){
+        advance();skip_nl();
+
+        /* optional tag: typedef struct Tag { } Alias  OR  typedef struct { } Alias */
+        char *tag=NULL;
+        if(check(TT_IDENT)){
+            /* look one token ahead to decide if this is a tag or something else */
+            /* We save position, consume the ident, check for '{', then restore or keep */
+            int saved=gpos;
+            Token *maybe_tag=advance();
+            skip_nl();
+            if(check(TT_LBRACE)){
+                tag=xstrdup(maybe_tag->val); /* it was a tag */
+            } else {
+                gpos=saved; /* not a tag, put it back */
+            }
+        }
+
+        expect(TT_LBRACE,"{");skip_nl();
+
+        /* Parse field list */
+        Node *sn=mknode(N_STRUCT,ln);
+        while(!check(TT_RBRACE)&&!check(TT_EOF)){
+            skip_nl();if(check(TT_RBRACE))break;
+            Token *fn2=expect(TT_IDENT,"field name");skip_nl();
+            expect(TT_COLON,":");skip_nl();
+            TypeRef *ftype=parse_type();
+            Field f;f.name=xstrdup(fn2->val);f.type=ftype;fl_push(&sn->fields,f);
+            skip_nl();match(TT_COMMA);skip_nl();
+        }
+        expect(TT_RBRACE,"}");skip_nl();
+
+        /* alias name after the closing brace */
+        Token *aname=expect(TT_IDENT,"typedef name");
+        char *alias=xstrdup(aname->val);
+
+        /* Name the struct with the alias; store tag in sval for typecheck */
+        sn->structname=xstrdup(alias);
+        if(tag) sn->sval=xstrdup(tag);
+
+        /* Register the typedef alias -> TY_STRUCT(alias) at parse time
+           so that any subsequent parse_type() calls can resolve it.
+           The StructInfo is registered in typecheck's first pass. */
+        TypeRef *tr=mktype(TY_STRUCT,alias,NULL);
+        register_typedef(alias,tr);
+        if(tag){
+            TypeRef *tr2=mktype(TY_STRUCT,alias,NULL);
+            register_typedef(tag,tr2);
+        }
+        return sn;
+    }
+
+    /* Forms 1 & 2: typedef <type> <newname> */
+    TypeRef *base=parse_type();
+    skip_nl();
+    Token *aname=expect(TT_IDENT,"typedef name");
+    register_typedef(aname->val,base);
+
+    /* Return a dummy N_IMPORT node (no code generated, just keeps AST clean) */
+    Node *dummy=mknode(N_IMPORT,ln);
+    dummy->import_path=NULL;
+    dummy->name=xstrdup(aname->val);
+    return dummy;
+}
+
 static Node *parse_program(void){
     Node *prog=mknode(N_PROGRAM,1);
     for(;;){
         skip_nl();TT t=peek()->type;if(t==TT_EOF)break;
         if(t==TT_FUNC)          nl_push(&prog->body,parse_func());
         else if(t==TT_STRUCT)   nl_push(&prog->body,parse_struct());
+        else if(t==TT_TYPEDEF)  nl_push(&prog->body,parse_typedef());
         else if(t==TT_IMPORT){
             advance();Token *path=expect(TT_STR_LIT,"import path");
             Node *im=mknode(N_IMPORT,path->line);im->import_path=xstrdup(path->val);
@@ -809,7 +902,49 @@ static StructInfo structs[512];
 static int nstructs=0;
 
 static StructInfo *find_struct(const char *name){
+    /* direct lookup first */
     for(int i=0;i<nstructs;i++)if(strcmp(structs[i].name,name)==0)return &structs[i];
+    /* then try to resolve through the typedef registry */
+    TypeRef *aliased=resolve_typedef(name);
+    if(aliased&&aliased->kind==TY_STRUCT&&aliased->name&&strcmp(aliased->name,name)!=0)
+        return find_struct(aliased->name);
+    return NULL;
+}
+
+/* ── typedef registry ───────────────────────────────────────────────── */
+typedef struct{char *alias;TypeRef *type;}TypeAlias;
+static TypeAlias typedefs[1024];
+static int ntypedefs=0;
+
+static void register_typedef(const char *alias,TypeRef *t){
+    for(int i=0;i<ntypedefs;i++)
+        if(strcmp(typedefs[i].alias,alias)==0)
+            die("typedef: '%s' already defined",alias);
+    if(ntypedefs>=1024)die("too many typedefs");
+    typedefs[ntypedefs].alias=xstrdup(alias);
+    typedefs[ntypedefs].type=t;
+    ntypedefs++;
+}
+
+/* Resolve alias chain up to 64 hops */
+static TypeRef *resolve_typedef(const char *name){
+    const char *cur=name;
+    for(int depth=0;depth<64;depth++){
+        int found=0;
+        for(int i=0;i<ntypedefs;i++){
+            if(strcmp(typedefs[i].alias,cur)==0){
+                TypeRef *t=typedefs[i].type;
+                if(t->kind==TY_STRUCT&&t->name){
+                    int is_alias=0;
+                    for(int j=0;j<ntypedefs;j++)
+                        if(strcmp(typedefs[j].alias,t->name)==0){is_alias=1;break;}
+                    if(is_alias){cur=t->name;found=1;break;}
+                }
+                return t;
+            }
+        }
+        if(!found)break;
+    }
     return NULL;
 }
 
@@ -1135,8 +1270,19 @@ static void typecheck(Node *prog){
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
         if(n->kind==N_STRUCT){
-            StructInfo *si=&structs[nstructs++];
-            si->name=xstrdup(n->structname);si->fields=n->fields.d;si->nfields=n->fields.n;
+            /* avoid double-registering (typedef struct {} Name already called
+               register_typedef at parse time; we still need the StructInfo) */
+            if(!find_struct(n->structname)){
+                StructInfo *si=&structs[nstructs++];
+                si->name=xstrdup(n->structname);
+                si->fields=n->fields.d;si->nfields=n->fields.n;
+            }
+            /* if this was 'typedef struct Tag { } Alias', also register Tag */
+            if(n->sval&&!find_struct(n->sval)){
+                StructInfo *si2=&structs[nstructs++];
+                si2->name=xstrdup(n->sval);
+                si2->fields=n->fields.d;si2->nfields=n->fields.n;
+            }
         }
         if(n->kind==N_FUNC){
             if(nfsigs>=1024)die("too many functions");
@@ -1196,13 +1342,27 @@ static int  nvars=0,frame_sz=0,lbl_cnt=0;
 static char break_lbl[64],cont_lbl[64];
 static int  has_std=0,freestanding=0;
 
+/* ── architecture selection ──────────────────────────────────────── */
+#define ARCH_X86_32 32
+#define ARCH_X86_64 64
+static int arch=ARCH_X86_32;   /* default: 32-bit */
+
+/* x86-64 System V AMD64 ABI integer argument registers (in order) */
+static const char *argregs64[6]={"rdi","rsi","rdx","rcx","r8","r9"};
+
 static int   new_label(void){return lbl_cnt++;}
 static Var  *find_var(const char *name){
     for(int i=nvars-1;i>=0;i--)if(strcmp(vars[i].name,name)==0)return &vars[i];return NULL;
 }
 static int alloc_var(const char *name,TypeRef *type){
-    /* long/double occupy 8 bytes; float 4 bytes; everything else 4 bytes */
-    int sz=(type&&(type->kind==TY_LONG||type->kind==TY_DOUBLE))?8:4;
+    int sz;
+    if(arch==ARCH_X86_64){
+        /* on 64-bit every slot is 8 bytes (simplest, always aligned) */
+        sz=8;
+    } else {
+        /* long/double occupy 8 bytes; float 4 bytes; everything else 4 bytes */
+        sz=(type&&(type->kind==TY_LONG||type->kind==TY_DOUBLE))?8:4;
+    }
     frame_sz+=sz;
     vars[nvars].name=xstrdup(name);
     vars[nvars].offset=-frame_sz;
@@ -2113,6 +2273,820 @@ static void emit_runtime(void){
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   CODE GENERATOR — x86-64 GAS AT&T, System V AMD64 ABI, syscall
+   Result of integer/pointer/bool/long expressions: rax
+   Result of float expressions:  xmm0 (32-bit lane)
+   Result of double expressions: xmm0 (64-bit lane)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+static void gen_expr64(Node *n);
+static void gen_stmt64(Node *n);
+
+static void gen_store64(Node *lv){
+    switch(lv->kind){
+    case N_IDENT:{
+        Var *v=find_var(lv->name);
+        if(!v)die("%s:%d: undefined variable '%s'",lv->file,lv->line,lv->name);
+        if(v->type&&(v->type->kind==TY_FLOAT)){
+            out("    movss %%xmm0,%d(%%rbp)\n",v->offset);
+        } else if(v->type&&(v->type->kind==TY_DOUBLE)){
+            out("    movsd %%xmm0,%d(%%rbp)\n",v->offset);
+        } else {
+            out("    movq %%rax,%d(%%rbp)\n",v->offset);
+        }
+        break;
+    }
+    case N_INDEX:
+        out("    pushq %%rax\n");
+        gen_expr64(lv->right); out("    pushq %%rax\n");
+        gen_expr64(lv->left);  out("    popq %%rcx\n");
+        /* array layout: [count:8][count:8][elem0][elem1]...  elements at base+16 */
+        out("    leaq 16(%%rax,%%rcx,8),%%rdx\n");
+        out("    popq %%rax\n    movq %%rax,(%%rdx)\n");
+        break;
+    case N_FIELD:{
+        out("    pushq %%rax\n"); gen_expr64(lv->left);
+        int found_off=-1;
+        for(int si=0;si<nstructs&&found_off<0;si++)
+            for(int fi=0;fi<structs[si].nfields;fi++)
+                if(strcmp(structs[si].fields[fi].name,lv->sval)==0){found_off=fi*8;break;}
+        if(found_off<0)die("unknown field '%s'",lv->sval);
+        out("    popq %%rcx\n    movq %%rcx,%d(%%rax)\n",found_off);
+        break;
+    }
+    default:die("gen_store64: not an lvalue");
+    }
+}
+
+static void gen_intrinsic64(Node *n){
+    const char *nm=n->callee;
+    if(strcmp(nm,"__syscall")==0){
+        int argc=n->args.n;
+        if(argc<1)die("__syscall: need at least syscall number");
+        /* evaluate args right-to-left, push, then load registers */
+        for(int i=argc-1;i>=0;i--){gen_expr64(n->args.d[i]);out("    pushq %%rax\n");}
+        out("    popq %%rax\n"); /* syscall number */
+        const char *sc[6]={"rdi","rsi","rdx","r10","r8","r9"};
+        for(int i=1;i<argc&&i<=6;i++) out("    popq %%%s\n",sc[i-1]);
+        out("    syscall\n");
+        return;
+    }
+    if(strcmp(nm,"__inb")==0){
+        gen_expr64(n->args.d[0]);
+        out("    movw %%ax,%%dx\n    xorl %%eax,%%eax\n    inb %%dx,%%al\n    movzbl %%al,%%eax\n");
+        return;
+    }
+    if(strcmp(nm,"__outb")==0){
+        gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[0]);out("    movw %%ax,%%dx\n");
+        out("    popq %%rax\n    outb %%al,%%dx\n    xorl %%eax,%%eax\n");
+        return;
+    }
+    if(strcmp(nm,"__cli")==0){out("    cli\n    xorl %%eax,%%eax\n");return;}
+    if(strcmp(nm,"__sti")==0){out("    sti\n    xorl %%eax,%%eax\n");return;}
+    if(strcmp(nm,"__hlt")==0){out("    hlt\n    xorl %%eax,%%eax\n");return;}
+    if(strcmp(nm,"__rdtsc")==0){out("    rdtsc\n    shlq $32,%%rdx\n    orq %%rdx,%%rax\n");return;}
+    if(strcmp(nm,"__peek")==0){
+        gen_expr64(n->args.d[0]);out("    movq (%%rax),%%rax\n");return;
+    }
+    if(strcmp(nm,"__poke")==0){
+        gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[0]);out("    popq %%rcx\n    movq %%rcx,(%%rax)\n    xorl %%eax,%%eax\n");return;
+    }
+    if(strcmp(nm,"__peekb")==0){
+        gen_expr64(n->args.d[0]);out("    movzbl (%%rax),%%eax\n");return;
+    }
+    if(strcmp(nm,"__pokeb")==0){
+        gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[0]);out("    popq %%rcx\n    movb %%cl,(%%rax)\n    xorl %%eax,%%eax\n");return;
+    }
+    if(strcmp(nm,"__memset")==0){
+        /* rdi=ptr, rsi=val, rdx=n */
+        gen_expr64(n->args.d[2]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[0]);
+        out("    movq %%rax,%%rdi\n");
+        out("    popq %%rsi\n    popq %%rdx\n");
+        out("    call _flr_memset\n");
+        return;
+    }
+    if(strcmp(nm,"__memcpy")==0){
+        gen_expr64(n->args.d[2]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
+        gen_expr64(n->args.d[0]);
+        out("    movq %%rax,%%rdi\n");
+        out("    popq %%rsi\n    popq %%rdx\n");
+        out("    call _flr_memcpy\n");
+        return;
+    }
+    die("unknown intrinsic '%s'",nm);
+}
+
+static void gen_expr64(Node *n){
+    if(!n){out("    xorl %%eax,%%eax\n");return;}
+    switch(n->kind){
+    case N_INTLIT:
+        out("    movq $%lld,%%rax\n",n->ival); break;
+    case N_LONGLIT:
+        out("    movq $%lld,%%rax\n",n->ival); break;
+    case N_BOOLLIT:
+        out("    movq $%d,%%rax\n",n->bval?1:0); break;
+    case N_FLOATLIT:{
+        int idx=add_flit(n->dval,0);
+        out("    movss .Lfl%d(%%rip),%%xmm0\n",idx); break;
+    }
+    case N_DOUBLELIT:{
+        int idx=add_flit(n->dval,1);
+        out("    movsd .Lfl%d(%%rip),%%xmm0\n",idx); break;
+    }
+    case N_STRLIT:
+        out("    leaq .Lstr%d(%%rip),%%rax\n",add_strlit(n->sval)); break;
+    case N_IDENT:{
+        Var *v=find_var(n->name);
+        if(!v)die("%s:%d: undefined variable '%s'",n->file,n->line,n->name);
+        if(v->type&&v->type->kind==TY_FLOAT){
+            out("    movss %d(%%rbp),%%xmm0\n",v->offset);
+        } else if(v->type&&v->type->kind==TY_DOUBLE){
+            out("    movsd %d(%%rbp),%%xmm0\n",v->offset);
+        } else {
+            out("    movq %d(%%rbp),%%rax\n",v->offset);
+        }
+        break;
+    }
+    case N_BINOP:{
+        const char *op=n->op;
+        int lf=(n->left&&n->left->etype&&(n->left->etype->kind==TY_FLOAT||n->left->etype->kind==TY_DOUBLE));
+        int rf=(n->right&&n->right->etype&&(n->right->etype->kind==TY_FLOAT||n->right->etype->kind==TY_DOUBLE));
+        int use_dbl=(n->etype&&n->etype->kind==TY_DOUBLE)||
+                    (n->left&&n->left->etype&&n->left->etype->kind==TY_DOUBLE)||
+                    (n->right&&n->right->etype&&n->right->etype->kind==TY_DOUBLE);
+
+        /* str + str → str_concat */
+        if(strcmp(op,"+")==0&&n->left->etype&&n->left->etype->kind==TY_STR){
+            gen_expr64(n->right); out("    pushq %%rax\n");
+            gen_expr64(n->left);
+            out("    movq %%rax,%%rdi\n    popq %%rsi\n");
+            out("    call _flr_str_concat\n");
+            break;
+        }
+
+        /* float/double via SSE2 */
+        if(lf||rf){
+            int is_cmp=(!strcmp(op,"==")||!strcmp(op,"!=")||!strcmp(op,"<")||!strcmp(op,">")||!strcmp(op,"<=")||!strcmp(op,">="));
+            /* evaluate rhs into xmm1, lhs into xmm0 */
+            gen_expr64(n->right);
+            if(use_dbl){
+                if(rf&&n->right->etype&&n->right->etype->kind==TY_DOUBLE)
+                    out("    movsd %%xmm0,%%xmm1\n");
+                else if(rf)
+                    out("    cvtss2sd %%xmm0,%%xmm1\n");
+                else
+                    out("    cvtsi2sdq %%rax,%%xmm1\n");
+            } else {
+                if(rf&&n->right->etype&&n->right->etype->kind==TY_FLOAT)
+                    out("    movss %%xmm0,%%xmm1\n");
+                else if(rf)
+                    out("    cvtsd2ss %%xmm0,%%xmm1\n");
+                else
+                    out("    cvtsi2ssl %%eax,%%xmm1\n");
+            }
+            gen_expr64(n->left);
+            if(use_dbl){
+                if(lf&&n->left->etype&&n->left->etype->kind==TY_DOUBLE)
+                    {}/* already in xmm0 */
+                else if(lf)
+                    out("    cvtss2sd %%xmm0,%%xmm0\n");
+                else
+                    out("    cvtsi2sdq %%rax,%%xmm0\n");
+            } else {
+                if(lf&&n->left->etype&&n->left->etype->kind==TY_FLOAT)
+                    {}/* already in xmm0 */
+                else if(lf)
+                    out("    cvtsd2ss %%xmm0,%%xmm0\n");
+                else
+                    out("    cvtsi2ssl %%eax,%%xmm0\n");
+            }
+            if(is_cmp){
+                if(use_dbl) out("    ucomisd %%xmm1,%%xmm0\n");
+                else        out("    ucomiss %%xmm1,%%xmm0\n");
+                if(!strcmp(op,"=="))     out("    sete %%al\n");
+                else if(!strcmp(op,"!="))out("    setne %%al\n");
+                else if(!strcmp(op,"<")) out("    setb %%al\n");
+                else if(!strcmp(op,">")) out("    seta %%al\n");
+                else if(!strcmp(op,"<="))out("    setbe %%al\n");
+                else if(!strcmp(op,">="))out("    setae %%al\n");
+                out("    movzbq %%al,%%rax\n");
+            } else {
+                if(use_dbl){
+                    if(!strcmp(op,"+"))     out("    addsd %%xmm1,%%xmm0\n");
+                    else if(!strcmp(op,"-"))out("    subsd %%xmm1,%%xmm0\n");  /* xmm0 = xmm0 - xmm1 */
+                    else if(!strcmp(op,"*"))out("    mulsd %%xmm1,%%xmm0\n");
+                    else if(!strcmp(op,"/"))out("    divsd %%xmm1,%%xmm0\n");
+                    else die("unsupported double op '%s'",op);
+                } else {
+                    if(!strcmp(op,"+"))     out("    addss %%xmm1,%%xmm0\n");
+                    else if(!strcmp(op,"-"))out("    subss %%xmm1,%%xmm0\n");
+                    else if(!strcmp(op,"*"))out("    mulss %%xmm1,%%xmm0\n");
+                    else if(!strcmp(op,"/"))out("    divss %%xmm1,%%xmm0\n");
+                    else die("unsupported float op '%s'",op);
+                }
+            }
+            break;
+        }
+
+        /* integer / long / bool — all native 64-bit */
+        gen_expr64(n->right); out("    pushq %%rax\n");
+        gen_expr64(n->left);  out("    popq %%rcx\n");
+        if     (!strcmp(op,"+"))  out("    addq %%rcx,%%rax\n");
+        else if(!strcmp(op,"-"))  out("    subq %%rcx,%%rax\n");
+        else if(!strcmp(op,"*"))  out("    imulq %%rcx,%%rax\n");
+        else if(!strcmp(op,"/"))  {out("    cqto\n");out("    idivq %%rcx\n");}
+        else if(!strcmp(op,"%"))  {out("    cqto\n");out("    idivq %%rcx\n");out("    movq %%rdx,%%rax\n");}
+        else if(!strcmp(op,"&"))  out("    andq %%rcx,%%rax\n");
+        else if(!strcmp(op,"|"))  out("    orq  %%rcx,%%rax\n");
+        else if(!strcmp(op,"^"))  out("    xorq %%rcx,%%rax\n");
+        else if(!strcmp(op,"<<")) out("    shlq %%cl,%%rax\n");
+        else if(!strcmp(op,">>")) out("    sarq %%cl,%%rax\n");
+        else if(!strcmp(op,"==")) {out("    cmpq %%rcx,%%rax\n");out("    sete %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,"!=")) {out("    cmpq %%rcx,%%rax\n");out("    setne %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,"<"))  {out("    cmpq %%rcx,%%rax\n");out("    setl %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,">"))  {out("    cmpq %%rcx,%%rax\n");out("    setg %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,"<=")) {out("    cmpq %%rcx,%%rax\n");out("    setle %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,">=")) {out("    cmpq %%rcx,%%rax\n");out("    setge %%al\n");out("    movzbq %%al,%%rax\n");}
+        else if(!strcmp(op,"and")){
+            out("    testq %%rax,%%rax\n");out("    setne %%al\n");
+            out("    testq %%rcx,%%rcx\n");out("    setne %%cl\n");
+            out("    andb %%cl,%%al\n");out("    movzbq %%al,%%rax\n");
+        }
+        else if(!strcmp(op,"or")){
+            out("    orq %%rcx,%%rax\n");out("    setne %%al\n");out("    movzbq %%al,%%rax\n");
+        }
+        else die("unknown binop '%s'",op);
+        break;
+    }
+    case N_UNOP:
+        gen_expr64(n->left);
+        if     (!strcmp(n->op,"-"))  out("    negq %%rax\n");
+        else if(!strcmp(n->op,"~"))  out("    notq %%rax\n");
+        else if(!strcmp(n->op,"not")){out("    testq %%rax,%%rax\n");out("    sete %%al\n");out("    movzbq %%al,%%rax\n");}
+        break;
+    case N_CALL:{
+        if(is_intrinsic(n->callee)){gen_intrinsic64(n);break;}
+
+        /* evaluate all args, push onto stack in reverse order,
+           then load first 6 into registers (integer ABI) */
+        int nargs=n->args.n;
+
+        /* handle print specially */
+        if(has_std&&strcmp(n->callee,"print")==0&&nargs==1){
+            Node *arg=n->args.d[0];
+            int is_str=(arg->etype&&arg->etype->kind==TY_STR);
+            int is_flt=(arg->etype&&arg->etype->kind==TY_FLOAT);
+            int is_dbl=(arg->etype&&arg->etype->kind==TY_DOUBLE);
+            if(!is_flt&&!is_dbl&&arg->kind==N_IDENT){
+                Var *v=find_var(arg->name);
+                if(v&&v->type&&v->type->kind==TY_FLOAT)is_flt=1;
+                if(v&&v->type&&v->type->kind==TY_DOUBLE)is_dbl=1;
+            }
+            gen_expr64(arg);
+            if(is_flt){out("    call _flr_print_float\n");}
+            else if(is_dbl){out("    call _flr_print_double\n");}
+            else if(is_str){out("    movq %%rax,%%rdi\n    call _flr_print_str\n");}
+            else           {out("    movq %%rax,%%rdi\n    call _flr_print_int\n");}
+            break;
+        }
+
+        /* str_concat(a,b) */
+        if(has_std&&strcmp(n->callee,"str_concat")==0&&nargs==2){
+            gen_expr64(n->args.d[1]); out("    pushq %%rax\n");
+            gen_expr64(n->args.d[0]);
+            out("    movq %%rax,%%rdi\n    popq %%rsi\n");
+            out("    call _flr_str_concat\n");
+            break;
+        }
+
+        /* str_format(fmt, ...) */
+        if(has_std&&strcmp(n->callee,"str_format")==0&&nargs>=1){
+            /* push extra args right-to-left, then nargs-1 count, then fmt */
+            for(int i=nargs-1;i>=1;i--){gen_expr64(n->args.d[i]);out("    pushq %%rax\n");}
+            out("    pushq $%d\n",nargs-1);
+            gen_expr64(n->args.d[0]); out("    pushq %%rax\n");
+            /* load first 2 into rdi/rsi */
+            out("    popq %%rdi\n    popq %%rsi\n");
+            /* remaining on stack — _flr_str_format reads from rsp+16 */
+            out("    call _flr_str_format\n");
+            if(nargs>1) out("    addq $%d,%%rsp\n",(nargs-1)*8);
+            break;
+        }
+
+        /* general call: push args r-to-l, load first 6 into regs */
+        for(int i=nargs-1;i>=0;i--){
+            gen_expr64(n->args.d[i]);
+            /* float/double: save xmm0 to stack slot */
+            int is_fp=(n->args.d[i]->etype&&
+                      (n->args.d[i]->etype->kind==TY_FLOAT||
+                       n->args.d[i]->etype->kind==TY_DOUBLE));
+            if(is_fp) out("    subq $8,%%rsp\n    movsd %%xmm0,(%%rsp)\n");
+            else       out("    pushq %%rax\n");
+        }
+        /* load up to 6 integer args into registers */
+        int ireg=0;
+        for(int i=0;i<nargs&&ireg<6;i++){
+            int is_fp=(n->args.d[i]->etype&&
+                      (n->args.d[i]->etype->kind==TY_FLOAT||
+                       n->args.d[i]->etype->kind==TY_DOUBLE));
+            if(!is_fp){
+                out("    popq %%%s\n",argregs64[ireg++]);
+            }
+            /* fp args stay on stack for now (simple approach) */
+        }
+        out("    xorl %%eax,%%eax\n"); /* al=0: no xmm args (conservative) */
+        out("    call %s\n",n->callee);
+        /* clean up any remaining stack args */
+        int rem=nargs-ireg;
+        if(rem>0) out("    addq $%d,%%rsp\n",rem*8);
+        break;
+    }
+    case N_INDEX:
+        gen_expr64(n->right); out("    pushq %%rax\n");
+        gen_expr64(n->left);  out("    popq %%rcx\n");
+        out("    leaq 16(%%rax,%%rcx,8),%%rax\n");
+        out("    movq (%%rax),%%rax\n"); break;
+    case N_FIELD:{
+        gen_expr64(n->left);
+        int found_off=-1;
+        for(int si=0;si<nstructs&&found_off<0;si++)
+            for(int fi=0;fi<structs[si].nfields;fi++)
+                if(strcmp(structs[si].fields[fi].name,n->sval)==0){found_off=fi*8;break;}
+        if(found_off<0)die("%s:%d: unknown field '%s'",n->file,n->line,n->sval);
+        out("    movq %d(%%rax),%%rax\n",found_off); break;
+    }
+    case N_ARRAYLIT:{
+        int cnt=n->elems.n;
+        long long alloc_sz=16+(long long)cnt*8;
+        out("    movq $%lld,%%rdi\n",alloc_sz);
+        out("    call _flr_alloc\n");
+        out("    pushq %%rax\n");
+        out("    movq $%d,(%%rax)\n    movq $%d,8(%%rax)\n",cnt,cnt);
+        for(int i=0;i<cnt;i++){
+            out("    movq (%%rsp),%%rdi\n");
+            gen_expr64(n->elems.d[i]);
+            out("    movq %%rax,%d(%%rdi)\n",(int)(16+i*8));
+        }
+        out("    popq %%rax\n"); break;
+    }
+    default:die("gen_expr64: unhandled kind %d",n->kind);
+    }
+}
+
+static void gen_stmt64(Node *n){
+    if(!n)return;
+    switch(n->kind){
+    case N_IMPORT:if(strcmp(n->import_path,"std")==0)has_std=1;break;
+    case N_VARDECL:
+    case N_LETDECL:
+    case N_CONSTDECL:{
+        TypeRef *vtype=n->typeref;
+        if(!vtype&&n->left&&n->left->etype)vtype=n->left->etype;
+        int off=alloc_var(n->name,vtype);
+        if(n->left){
+            gen_expr64(n->left);
+            if(vtype&&vtype->kind==TY_FLOAT)
+                out("    movss %%xmm0,%d(%%rbp)\n",off);
+            else if(vtype&&vtype->kind==TY_DOUBLE)
+                out("    movsd %%xmm0,%d(%%rbp)\n",off);
+            else
+                out("    movq %%rax,%d(%%rbp)\n",off);
+        } else {
+            out("    movq $0,%d(%%rbp)\n",off);
+        }
+        break;
+    }
+    case N_ASSIGN:{
+        gen_expr64(n->right);
+        if(strcmp(n->op,"=")==0){gen_store64(n->left);}
+        else{
+            /* compound: load lhs into rcx/xmm1, operate, store */
+            int is_fp=(n->left->etype&&(n->left->etype->kind==TY_FLOAT||n->left->etype->kind==TY_DOUBLE));
+            if(is_fp){
+                /* save rhs xmm0 -> xmm1, load lhs -> xmm0, operate */
+                int dbl=(n->left->etype->kind==TY_DOUBLE);
+                if(dbl) out("    movsd %%xmm0,%%xmm1\n"); else out("    movss %%xmm0,%%xmm1\n");
+                gen_expr64(n->left);
+                if(!strcmp(n->op,"+=")){ if(dbl)out("    addsd %%xmm1,%%xmm0\n");else out("    addss %%xmm1,%%xmm0\n");}
+                else if(!strcmp(n->op,"-=")){ if(dbl)out("    subsd %%xmm1,%%xmm0\n");else out("    subss %%xmm1,%%xmm0\n");}
+                else if(!strcmp(n->op,"*=")){ if(dbl)out("    mulsd %%xmm1,%%xmm0\n");else out("    mulss %%xmm1,%%xmm0\n");}
+                else if(!strcmp(n->op,"/=")){ if(dbl)out("    divsd %%xmm1,%%xmm0\n");else out("    divss %%xmm1,%%xmm0\n");}
+                gen_store64(n->left);
+            } else {
+                out("    pushq %%rax\n"); gen_expr64(n->left); out("    popq %%rcx\n");
+                if     (!strcmp(n->op,"+="))  out("    addq %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"-="))  out("    subq %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"*="))  out("    imulq %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"/="))  {out("    pushq %%rcx\n    cqto\n    idivq (%%rsp)\n    addq $8,%%rsp\n");}
+                else if(!strcmp(n->op,"%="))  {out("    pushq %%rcx\n    cqto\n    idivq (%%rsp)\n    addq $8,%%rsp\n    movq %%rdx,%%rax\n");}
+                else if(!strcmp(n->op,"&="))  out("    andq %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"|="))  out("    orq  %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"^="))  out("    xorq %%rcx,%%rax\n");
+                else if(!strcmp(n->op,"<<=")) out("    shlq %%cl,%%rax\n");
+                else if(!strcmp(n->op,">>=")) out("    sarq %%cl,%%rax\n");
+                gen_store64(n->left);
+            }
+        }
+        break;
+    }
+    case N_RETURN:
+        if(n->left) gen_expr64(n->left);
+        else out("    xorl %%eax,%%eax\n");
+        out("    addq $%d,%%rsp\n",((frame_sz+15)&~15)); /* dealloc locals */
+        out("    popq %%r15\n    popq %%r14\n    popq %%r13\n");
+        out("    popq %%rbx\n");
+        out("    leave\n    ret\n");
+        break;
+    case N_EXPRSTMT:{
+        Node *e=n->left;
+        /* special-case print at statement level (avoids duplicate dispatch) */
+        if(has_std&&e->kind==N_CALL&&strcmp(e->callee,"print")==0&&e->args.n==1){
+            Node *arg=e->args.d[0];
+            int is_str=(arg->etype&&arg->etype->kind==TY_STR);
+            int is_flt=(arg->etype&&arg->etype->kind==TY_FLOAT);
+            int is_dbl=(arg->etype&&arg->etype->kind==TY_DOUBLE);
+            if(!is_flt&&!is_dbl&&arg->kind==N_IDENT){
+                Var *v=find_var(arg->name);
+                if(v&&v->type&&v->type->kind==TY_FLOAT)is_flt=1;
+                if(v&&v->type&&v->type->kind==TY_DOUBLE)is_dbl=1;
+            }
+            gen_expr64(arg);
+            if(is_flt)      out("    call _flr_print_float\n");
+            else if(is_dbl) out("    call _flr_print_double\n");
+            else if(is_str) out("    movq %%rax,%%rdi\n    call _flr_print_str\n");
+            else            out("    movq %%rax,%%rdi\n    call _flr_print_int\n");
+            break;
+        }
+        gen_expr64(e); break;
+    }
+    case N_IF:{
+        int lend=new_label(),lnext=new_label();
+        gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lif%d\n",lnext);
+        for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
+        out("    jmp .Lif%d\n.Lif%d:\n",lend,lnext);
+        for(int ei=0;ei<n->elifs.n;ei++){
+            ElifClause *ec=&n->elifs.d[ei];int ln2=new_label();
+            gen_expr64(ec->cond);out("    testq %%rax,%%rax\n    je .Lif%d\n",ln2);
+            for(int i=0;i<ec->body.n;i++)gen_stmt64(ec->body.d[i]);
+            out("    jmp .Lif%d\n.Lif%d:\n",lend,ln2);
+        }
+        for(int i=0;i<n->else_body.n;i++)gen_stmt64(n->else_body.d[i]);
+        out(".Lif%d:\n",lend); break;
+    }
+    case N_WHILE:{
+        int ls=new_label(),le=new_label();
+        char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
+        snprintf(break_lbl,64,".Lwh%d",le);snprintf(cont_lbl,64,".Lwh%d",ls);
+        out(".Lwh%d:\n",ls);gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lwh%d\n",le);
+        for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
+        out("    jmp .Lwh%d\n.Lwh%d:\n",ls,le);
+        strcpy(break_lbl,ob);strcpy(cont_lbl,oc); break;
+    }
+    case N_FOR:{
+        int ls=new_label(),le=new_label(),lp=new_label();
+        char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
+        snprintf(break_lbl,64,".Lfor%d",le);snprintf(cont_lbl,64,".Lfor%d",lp);
+        gen_stmt64(n->for_init);
+        out(".Lfor%d:\n",ls);gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lfor%d\n",le);
+        for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
+        out(".Lfor%d:\n",lp);gen_stmt64(n->for_post);
+        out("    jmp .Lfor%d\n.Lfor%d:\n",ls,le);
+        strcpy(break_lbl,ob);strcpy(cont_lbl,oc); break;
+    }
+    case N_BREAK:
+        if(!break_lbl[0])die("%s:%d: break outside loop",n->file,n->line);
+        out("    jmp %s\n",break_lbl); break;
+    case N_CONTINUE:
+        if(!cont_lbl[0])die("%s:%d: continue outside loop",n->file,n->line);
+        out("    jmp %s\n",cont_lbl); break;
+    default:die("gen_stmt64: unhandled kind %d",n->kind);
+    }
+}
+
+static void gen_func64(Node *fn){
+    nvars=0;frame_sz=0;
+    memset(break_lbl,0,sizeof break_lbl);memset(cont_lbl,0,sizeof cont_lbl);
+
+    /* parameters: first 6 ints via registers, rest on stack above rbp+16 */
+    /* we store all params as locals for simplicity */
+    /* allocate slots for params */
+    for(int i=0;i<fn->params.n;i++){
+        int off=alloc_var(fn->params.d[i].name,fn->params.d[i].type);
+        (void)off;
+    }
+
+    /* generate body into temp buffer */
+    size_t body_start=out_len;
+    /* emit param loads INSIDE the body buffer (after prologue sets up frame) */
+    /* we'll emit them first, then the actual stmts */
+    for(int i=0;i<fn->params.n;i++){
+        Var *v=&vars[i]; /* params are allocated first */
+        if(i<6){
+            int is_fp=(v->type&&(v->type->kind==TY_FLOAT||v->type->kind==TY_DOUBLE));
+            if(is_fp){
+                /* xmm args: xmm0..xmm7 */
+                if(v->type->kind==TY_DOUBLE)
+                    out("    movsd %%xmm%d,%d(%%rbp)\n",i,v->offset);
+                else
+                    out("    movss %%xmm%d,%d(%%rbp)\n",i,v->offset);
+            } else {
+                out("    movq %%%s,%d(%%rbp)\n",argregs64[i],v->offset);
+            }
+        } else {
+            /* extra params are at rbp+16, rbp+24, ... */
+            int stack_off=16+(i-6)*8;
+            out("    movq %d(%%rbp),%%rax\n",stack_off);
+            out("    movq %%rax,%d(%%rbp)\n",v->offset);
+        }
+    }
+    for(int i=0;i<fn->body.n;i++)gen_stmt64(fn->body.d[i]);
+
+    size_t body_len=out_len-body_start;
+    char *body_asm=malloc(body_len+1);
+    memcpy(body_asm,out_buf+body_start,body_len);body_asm[body_len]=0;
+    out_len=body_start;out_buf[out_len]=0;
+
+    int fsz=(frame_sz+15)&~15;
+
+    out(".globl %s\n%s:\n",fn->fname,fn->fname);
+    out("    pushq %%rbp\n    movq %%rsp,%%rbp\n");
+    if(fsz>0) out("    subq $%d,%%rsp\n",fsz);
+    /* save callee-saved registers */
+    out("    pushq %%rbx\n");
+    out("    pushq %%r13\n    pushq %%r14\n    pushq %%r15\n");
+
+    /* paste body */
+    if(out_len+body_len+1>out_cap){out_cap=out_cap*2+body_len+64;out_buf=realloc(out_buf,out_cap);}
+    memcpy(out_buf+out_len,body_asm,body_len);out_len+=body_len;out_buf[out_len]=0;free(body_asm);
+
+    if(strcmp(fn->fname,"main")==0){
+        if(!freestanding){
+            out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%rbx\n");
+            out("    xorl %%edi,%%edi\n    movl $60,%%eax\n    syscall\n");
+        } else {
+            out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%rbx\n");
+            out("    cli\n.Lhlt_loop:\n    hlt\n    jmp .Lhlt_loop\n");
+        }
+    } else {
+        out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%rbx\n");
+        out("    leave\n    ret\n");
+    }
+    out("\n");
+}
+
+/* ── 64-bit runtime ──────────────────────────────────────────────── */
+static void emit_runtime64(void){
+    if(!has_std||freestanding)return;
+    out("# ── Falcon Runtime 64-bit (inline) ───────────────────────────\n");
+    /* ELF entry point */
+    out(".globl _start\n_start:\n");
+    out("    xorl %%ebp,%%ebp\n");
+    out("    call main\n");
+    out("    movl %%eax,%%edi\n");
+    out("    movl $60,%%eax\n");
+    out("    syscall\n\n");
+
+    /* memset(ptr:rdi, val:rsi, n:rdx) */
+    out("_flr_memset:\n");
+    out("    movq %%rdi,%%rax\n    movq %%rdx,%%rcx\n    movb %%sil,%%al\n");
+    out("    rep stosb\n    ret\n\n");
+
+    /* memcpy(dst:rdi, src:rsi, n:rdx) */
+    out("_flr_memcpy:\n");
+    out("    movq %%rdx,%%rcx\n    rep movsb\n    ret\n\n");
+
+    /* print_str(s:rdi) */
+    out("_flr_print_str:\n");
+    out("    pushq %%rbx\n");
+    out("    movq %%rdi,%%rbx\n");
+    /* strlen: walk rsi until NUL */
+    out("    movq %%rdi,%%rsi\n");
+    out(".Lfps64_l:\n    cmpb $0,(%%rsi)\n    je .Lfps64_d\n    incq %%rsi\n    jmp .Lfps64_l\n");
+    out(".Lfps64_d:\n    subq %%rbx,%%rsi\n    movq %%rsi,%%rdx\n"); /* rdx = len */
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%rbx,%%rsi\n    syscall\n");
+    /* newline */
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out("    popq %%rbx\n    ret\n\n");
+
+    /* print_int(n:rdi) */
+    out("_flr_print_int:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n");
+    out("    movq %%rdi,%%rax\n");
+    out("    leaq .Lflr_ibuf+22(%%rip),%%r12\n    movb $10,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jge .Lfpi64_pos\n");
+    out("    negq %%rax\n    movq $1,%%r13\n    jmp .Lfpi64_l\n");
+    out(".Lfpi64_pos:\n    xorl %%r13d,%%r13d\n");
+    out(".Lfpi64_l:\n    movq $10,%%rcx\n    xorl %%edx,%%edx\n    divq %%rcx\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jne .Lfpi64_l\n");
+    out("    testq %%r13,%%r13\n    je .Lfpi64_nom\n");
+    out("    movb $45,(%%r12)\n    decq %%r12\n");
+    out(".Lfpi64_nom:\n    incq %%r12\n");
+    out("    leaq .Lflr_ibuf+23(%%rip),%%rdx\n    subq %%r12,%%rdx\n");
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    syscall\n");
+    /* newline */
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out("    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* exit(code:rdi) */
+    out("_flr_exit:\n    movl $60,%%eax\n    syscall\n\n");
+
+    /* print_float(val in xmm0) — widen to double and print */
+    out("_flr_print_float:\n");
+    out("    cvtss2sd %%xmm0,%%xmm0\n");
+    out("    call _flr_print_double\n    ret\n\n");
+
+    /* print_double(val in xmm0) — integer digits + 6 decimal places */
+    out("_flr_print_double:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n");
+    /* check sign via movq xmm0->rax, test high bit */
+    out("    movq %%xmm0,%%rax\n");
+    out("    testq %%rax,%%rax\n    jns .Lfpd64_pos\n");
+    /* negative: flip sign bit, print '-' */
+    out("    movabsq $0x8000000000000000,%%rcx\n    xorq %%rcx,%%rax\n    movq %%rax,%%xmm0\n");
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_minus(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out(".Lfpd64_pos:\n");
+    /* extract integer part */
+    out("    cvttsd2si %%xmm0,%%rdi\n    call _flr_print_int_nonl\n");
+    /* decimal point */
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_dot(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    /* fraction: (val - floor(val)) * 1e6, print 6 digits */
+    out("    cvttsd2si %%xmm0,%%rax\n    cvtsi2sdq %%rax,%%xmm1\n");
+    out("    subsd %%xmm1,%%xmm0\n");
+    out("    movsd .Lflr_1e6(%%rip),%%xmm1\n    mulsd %%xmm1,%%xmm0\n");
+    out("    cvttsd2si %%xmm0,%%rax\n    testq %%rax,%%rax\n    jge .Lfpd64_fpos\n    negq %%rax\n");
+    out(".Lfpd64_fpos:\n");
+    /* print 6 zero-padded decimal digits */
+    out("    leaq .Lflr_ibuf+12(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
+    out("    movl $6,%%ecx\n");
+    out(".Lfpd64_fl:\n    movq $10,%%r13\n    xorl %%edx,%%edx\n    divq %%r13\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%r12)\n    decq %%r12\n    loop .Lfpd64_fl\n");
+    out("    incq %%r12\n");
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    movq $6,%%rdx\n    syscall\n");
+    /* newline */
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out("    popq %%r14\n    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* print_int_nonl — print int in rdi without newline (helper for double) */
+    out("_flr_print_int_nonl:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n");
+    out("    movq %%rdi,%%rax\n");
+    out("    leaq .Lflr_ibuf+22(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jge .Lpni64_pos\n");
+    out("    negq %%rax\n    movq $1,%%r13\n    jmp .Lpni64_l\n");
+    out(".Lpni64_pos:\n    xorl %%r13d,%%r13d\n");
+    out(".Lpni64_l:\n    movq $10,%%rcx\n    xorl %%edx,%%edx\n    divq %%rcx\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jne .Lpni64_l\n");
+    out("    testq %%r13,%%r13\n    je .Lpni64_nom\n");
+    out("    movb $45,(%%r12)\n    decq %%r12\n");
+    out(".Lpni64_nom:\n    incq %%r12\n");
+    out("    leaq .Lflr_ibuf+23(%%rip),%%rdx\n    subq %%r12,%%rdx\n");
+    out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    syscall\n");
+    out("    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* strlen */
+    out("_flr_strlen:\n");
+    out("    movq %%rdi,%%rax\n");
+    out(".Lflrsl64:\n    cmpb $0,(%%rax)\n    je .Lflrsld64\n    incq %%rax\n    jmp .Lflrsl64\n");
+    out(".Lflrsld64:\n    subq %%rdi,%%rax\n    ret\n\n");
+    out("_flr_str_len:\n    jmp _flr_strlen\n\n");
+
+    /* str_eq(a:rdi, b:rsi) */
+    out("_flr_str_eq:\n");
+    out(".Lfseq64:\n    movzbl (%%rdi),%%eax\n    movzbl (%%rsi),%%ecx\n");
+    out("    cmpl %%ecx,%%eax\n    jne .Lfseq64_no\n    testl %%eax,%%eax\n    je .Lfseq64_yes\n");
+    out("    incq %%rdi\n    incq %%rsi\n    jmp .Lfseq64\n");
+    out(".Lfseq64_yes:\n    movl $1,%%eax\n    ret\n");
+    out(".Lfseq64_no:\n    xorl %%eax,%%eax\n    ret\n\n");
+
+    /* int_to_str(n:rdi) -> rax (static buffer) */
+    out("_flr_int_to_str:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n");
+    out("    movq %%rdi,%%rax\n");
+    out("    leaq .Lflr_ibuf+11(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jge .Lfits64_p\n    negq %%rax\n    movq $1,%%rbx\n    jmp .Lfits64_l\n");
+    out(".Lfits64_p:\n    xorl %%ebx,%%ebx\n");
+    out(".Lfits64_l:\n    movq $10,%%rcx\n    xorl %%edx,%%edx\n    divq %%rcx\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%r12)\n    decq %%r12\n");
+    out("    testq %%rax,%%rax\n    jne .Lfits64_l\n");
+    out("    testq %%rbx,%%rbx\n    je .Lfits64_n\n    movb $45,(%%r12)\n    decq %%r12\n");
+    out(".Lfits64_n:\n    incq %%r12\n    movq %%r12,%%rax\n");
+    out("    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* str_to_int(s:rdi) -> rax */
+    out("_flr_str_to_int:\n");
+    out("    xorl %%eax,%%eax\n    xorl %%ecx,%%ecx\n");
+    out("    cmpb $45,(%%rdi)\n    jne .Lfsti64_l\n    movl $1,%%ecx\n    incq %%rdi\n");
+    out(".Lfsti64_l:\n    movzbl (%%rdi),%%edx\n    cmpl $48,%%edx\n    jl .Lfsti64_d\n");
+    out("    cmpl $57,%%edx\n    jg .Lfsti64_d\n    imulq $10,%%rax\n    subl $48,%%edx\n    addl %%edx,%%eax\n");
+    out("    incq %%rdi\n    jmp .Lfsti64_l\n");
+    out(".Lfsti64_d:\n    testl %%ecx,%%ecx\n    je .Lfsti64_r\n    negq %%rax\n");
+    out(".Lfsti64_r:\n    ret\n\n");
+
+    /* abs/min/max */
+    out("_flr_abs:\n    movq %%rdi,%%rax\n    testq %%rax,%%rax\n    jge .Labs64_ok\n    negq %%rax\n.Labs64_ok:\n    ret\n\n");
+    out("_flr_min:\n    movq %%rdi,%%rax\n    cmpq %%rsi,%%rax\n    jle .Lmin64_ok\n    movq %%rsi,%%rax\n.Lmin64_ok:\n    ret\n\n");
+    out("_flr_max:\n    movq %%rdi,%%rax\n    cmpq %%rsi,%%rax\n    jge .Lmax64_ok\n    movq %%rsi,%%rax\n.Lmax64_ok:\n    ret\n\n");
+
+    /* assert(cond:rdi, msg:rsi) */
+    out("_flr_assert:\n");
+    out("    testq %%rdi,%%rdi\n    jne .Lassert64_ok\n");
+    out("    movq $1,%%rax\n    movq $2,%%rdi\n    leaq .Lflr_assert_msg(%%rip),%%rsi\n    movq $19,%%rdx\n    syscall\n");
+    out("    pushq %%rsi\n    call _flr_strlen\n    popq %%rsi\n");
+    out("    movq %%rax,%%rdx\n    movq $1,%%rax\n    movq $2,%%rdi\n    syscall\n");
+    out("    movq $1,%%rax\n    movq $2,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out("    movq $60,%%rax\n    movq $1,%%rdi\n    syscall\n");
+    out(".Lassert64_ok:\n    ret\n\n");
+
+    /* alloc(size:rdi) -> rax  — uses mmap(NULL,size,PROT_RW,MAP_ANON|MAP_PRIV,-1,0) */
+    out("_flr_alloc:\n");
+    out("    pushq %%rbx\n");
+    out("    movq %%rdi,%%rsi\n");            /* length */
+    out("    addq $7,%%rsi\n    andq $-8,%%rsi\n"); /* align to 8 */
+    out("    xorl %%edi,%%edi\n");             /* addr = NULL */
+    out("    movl $3,%%edx\n");               /* PROT_READ|PROT_WRITE */
+    out("    movl $0x22,%%r10d\n");            /* MAP_PRIVATE|MAP_ANONYMOUS */
+    out("    movq $-1,%%r8\n");               /* fd = -1 */
+    out("    xorl %%r9d,%%r9d\n");             /* offset = 0 */
+    out("    movl $9,%%eax\n");               /* sys_mmap */
+    out("    syscall\n");
+    out("    popq %%rbx\n    ret\n\n");
+    out("_flr_free:\n    ret\n\n");           /* no-op bump */
+
+    /* str_concat(a:rdi, b:rsi) -> rax */
+    out("_flr_str_concat:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n");
+    out("    movq %%rdi,%%r12\n    movq %%rsi,%%r13\n");
+    out("    call _flr_strlen\n    movq %%rax,%%rbx\n"); /* len(a) */
+    out("    movq %%r13,%%rdi\n    call _flr_strlen\n");  /* len(b) */
+    out("    addq %%rbx,%%rax\n    incq %%rax\n");        /* total */
+    out("    movq %%rax,%%rdi\n    call _flr_alloc\n");
+    out("    pushq %%rax\n");
+    /* copy a */
+    out("    movq %%rax,%%rdi\n    movq %%r12,%%rsi\n");
+    out(".Lsca64_l:\n    movzbl (%%rsi),%%ecx\n    testl %%ecx,%%ecx\n    je .Lsca64_d\n");
+    out("    movb %%cl,(%%rdi)\n    incq %%rsi\n    incq %%rdi\n    jmp .Lsca64_l\n");
+    out(".Lsca64_d:\n");
+    /* copy b */
+    out("    movq %%r13,%%rsi\n");
+    out(".Lscb64_l:\n    movzbl (%%rsi),%%ecx\n    movb %%cl,(%%rdi)\n    testl %%ecx,%%ecx\n    je .Lscb64_d\n");
+    out("    incq %%rsi\n    incq %%rdi\n    jmp .Lscb64_l\n");
+    out(".Lscb64_d:\n");
+    out("    popq %%rax\n");
+    out("    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* str_format(fmt:rdi, nargs:rsi, arg0...) -> rax */
+    out("_flr_str_format:\n");
+    out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%r15\n");
+    out("    movq %%rdi,%%r12\n");   /* fmt */
+    out("    movq %%rsi,%%r13\n");   /* nargs */
+    out("    leaq 16(%%rsp),%%r14\n"); /* &arg0 on stack (after pushes) — caller put them above ret addr */
+    /* alloc 512 output bytes */
+    out("    movq $512,%%rdi\n    call _flr_alloc\n");
+    out("    movq %%rax,%%r15\n    pushq %%rax\n"); /* save output ptr */
+    out("    movq %%rax,%%rbx\n");  /* rbx = write ptr */
+    out(".Lsfmt64_l:\n");
+    out("    movzbl (%%r12),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_end\n");
+    out("    cmpl $37,%%eax\n    jne .Lsfmt64_copy\n");
+    out("    incq %%r12\n    movzbl (%%r12),%%eax\n");
+    out("    cmpl $37,%%eax\n    je .Lsfmt64_copy\n");
+    out("    cmpl $100,%%eax\n    je .Lsfmt64_d\n");
+    out("    cmpl $115,%%eax\n    je .Lsfmt64_s\n");
+    out("    jmp .Lsfmt64_copy\n");
+    /* %d */
+    out(".Lsfmt64_d:\n    incq %%r12\n");
+    out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
+    out("    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%rbx\n");
+    out("    movq (%%r14),%%rdi\n    addq $8,%%r14\n    decq %%r13\n");
+    out("    call _flr_int_to_str\n    movq %%rax,%%rsi\n");
+    out(".Lsfmt64_dc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_dr\n");
+    out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_dc\n");
+    out(".Lsfmt64_dr:\n    popq %%rbx\n    popq %%r14\n    popq %%r13\n    popq %%r12\n");
+    out("    jmp .Lsfmt64_l\n");
+    /* %s */
+    out(".Lsfmt64_s:\n    incq %%r12\n");
+    out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
+    out("    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%rbx\n");
+    out("    movq (%%r14),%%rsi\n    addq $8,%%r14\n    decq %%r13\n");
+    out(".Lsfmt64_sc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_sr\n");
+    out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_sc\n");
+    out(".Lsfmt64_sr:\n    popq %%rbx\n    popq %%r14\n    popq %%r13\n    popq %%r12\n");
+    out("    jmp .Lsfmt64_l\n");
+    /* plain copy */
+    out(".Lsfmt64_copy:\n    movb %%al,(%%rbx)\n    incq %%r12\n    incq %%rbx\n    jmp .Lsfmt64_l\n");
+    out(".Lsfmt64_end:\n    movb $0,(%%rbx)\n");
+    out("    popq %%rax\n"); /* return result ptr */
+    out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+}
+
 static void emit_strlit(const char *s){
     out("    .ascii \"");
     for(const char *p=s;*p;p++){
@@ -2129,20 +3103,19 @@ static void emit_strlit(const char *s){
 static void emit_data(void){
     out(".section .data\n");
     if(has_std&&!freestanding){
-        out(".Lflr_ibuf:\n    .space 32\n"); /* extra space for long print */
+        out(".Lflr_ibuf:\n    .space 32\n");
         out(".Lflr_nl:\n    .byte 10\n");
         out(".Lflr_dot:\n    .ascii \".\"\n");
         out(".Lflr_minus:\n    .ascii \"-\"\n");
-        out(".Lflr_1e6:\n    .long 0\n    .long 1093567616\n"); /* 1000000.0 as double */
+        /* 1000000.0 as IEEE-754 double (little-endian 64-bit) */
+        out(".Lflr_1e6:\n    .long 0\n    .long 1093567616\n");
         out(".Lflr_assert_msg:\n    .ascii \"assertion failed: \"\n");
     }
     out(".section .rodata\n");
     for(int i=0;i<nstr_lits;i++){out(".Lstr%d:\n",i);emit_strlit(str_lits[i]);}
-    /* float/double constants */
     for(int i=0;i<nflits;i++){
         out(".Lfl%d:\n",i);
         if(flits[i].is_double){
-            /* emit as two 32-bit words (little-endian) */
             union{double d;unsigned u[2];}cv;cv.d=flits[i].val;
             out("    .long %u\n    .long %u\n",cv.u[0],cv.u[1]);
         } else {
@@ -2150,7 +3123,6 @@ static void emit_data(void){
             out("    .long %u\n",cv.u);
         }
     }
-    /* zero double constant for widening */
     out(".Lfl_zero:\n    .long 0\n    .long 0\n");
 }
 
@@ -2158,13 +3130,20 @@ static void codegen(Node *prog){
     /* structs and has_std already registered by typecheck; re-scan for has_std */
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
-        if(n->kind==N_IMPORT&&strcmp(n->import_path,"std")==0)has_std=1;
+        if(n->kind==N_IMPORT&&n->import_path&&strcmp(n->import_path,"std")==0)has_std=1;
     }
     out(".section .text\n\n");
-    for(int i=0;i<prog->body.n;i++){
-        Node *n=prog->body.d[i];if(n->kind==N_FUNC)gen_func(n);
+    if(arch==ARCH_X86_64){
+        for(int i=0;i<prog->body.n;i++){
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC)gen_func64(n);
+        }
+        emit_runtime64();
+    } else {
+        for(int i=0;i<prog->body.n;i++){
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC)gen_func(n);
+        }
+        emit_runtime();
     }
-    emit_runtime();
     emit_data();
 }
 
@@ -2184,16 +3163,30 @@ int main(int argc,char **argv){
         if(strcmp(argv[i],"--freestanding")==0)     freestanding=1;
         else if(strcmp(argv[i],"-o")==0&&i+1<argc)  outfile=argv[++i];
         else if(strncmp(argv[i],"-I",2)==0)          add_search(argv[i]+2);
+        else if(strcmp(argv[i],"-arch")==0&&i+1<argc){
+            i++;
+            if(strcmp(argv[i],"x86-64-linux")==0)       arch=ARCH_X86_64;
+            else if(strcmp(argv[i],"x86-32-linux")==0)  arch=ARCH_X86_32;
+            else die("unknown arch '%s' (valid: x86-32-linux, x86-64-linux)",argv[i]);
+        }
         else if(!infile)                             infile=argv[i];
     }
     if(!infile){
         fprintf(stderr,
-            "falconc v3 — Falcon language compiler\n"
-            "usage: falconc <input.fl> [-o out.s] [--freestanding] [-I<path>...]\n\n"
-            "new in v3: float, double, let, const\nnew in v2: long, type checker, str_concat, str_format\n\n"
-            "hosted linking:\n"
+            "falconc v4 — Falcon language compiler\n"
+            "usage: falconc <input.fl> [-o out.s] [-arch <target>] [--freestanding] [-I<path>...]\n\n"
+            "targets:\n"
+            "  -arch x86-32-linux   32-bit Linux, cdecl, int 0x80  (default)\n"
+            "  -arch x86-64-linux   64-bit Linux, System V AMD64, syscall\n\n"
+            "new in v4: -arch x86-64-linux\n"
+            "new in v3: float, double, let, const\n"
+            "new in v2: long, type checker, str_concat, str_format\n\n"
+            "32-bit linking:\n"
             "  as --32 out.s -o out.o\n"
-            "  ld -m elf_i386 flr.o out.o -o prog\n"
+            "  ld -m elf_i386 flr.o out.o -o prog\n\n"
+            "64-bit linking:\n"
+            "  as out.s -o out.o\n"
+            "  ld out.o -o prog\n"
         );
         return 1;
     }
