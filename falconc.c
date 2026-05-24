@@ -338,6 +338,7 @@ static void expand_imports(int start,const char *from_file){
             const char *name=gtoks[i+1].val;
             char *resolved=resolve_import(name,from_file);
             if(!resolved){
+                /* No real std.fl was found: use Falcon's virtual std runtime. */
                 if(strcmp(name,"std")==0){has_std=1;continue;}
                 die("%s:%d: cannot find import '%s'",gtoks[i].file,gtoks[i].line,name);
             }
@@ -345,7 +346,11 @@ static void expand_imports(int start,const char *from_file){
                 memmove(&gtoks[i],&gtoks[i+2],(gntoks-(i+2))*sizeof(Token));
                 gntoks-=2;free(resolved);i--;continue;
             }
-            if(strstr(resolved,"std.fl")||strcmp(name,"std")==0)has_std=1;
+            /*
+             * A real file named std.fl is just a normal source import.
+             * This lets projects and libraries ship their own std.fl without
+             * accidentally enabling Falcon's built-in runtime.
+             */
             int splice_start=gntoks;
             tokenize_file(resolved);
             int splice_count=gntoks-splice_start;
@@ -970,7 +975,7 @@ static TypeRef *tc_expr(Node *n,TypeRef *expected_ret);
 
 /* return type of a builtin/runtime call; NULL means "not a known builtin" */
 static TypeRef *builtin_rettype(const char *name){
-    if(strcmp(name,"print")==0)              return mktype(TY_VOID,NULL,NULL);
+    if(has_std&&strcmp(name,"print")==0)     return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"len")==0)                return mktype(TY_INT,NULL,NULL);
     if(strcmp(name,"str_concat")==0)         return mktype(TY_STR,NULL,NULL);
     if(strcmp(name,"str_format")==0)         return mktype(TY_STR,NULL,NULL);
@@ -1074,8 +1079,8 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
     case N_CALL:{
         /* check each argument */
         for(int i=0;i<n->args.n;i++)tc_expr(n->args.d[i],ret);
-        /* special: print takes any single value */
-        if(strcmp(n->callee,"print")==0){
+        /* virtual std special: print takes any single value */
+        if(has_std&&strcmp(n->callee,"print")==0){
             if(n->args.n!=1)die("%s:%d: print takes 1 argument",n->file,n->line);
             n->etype=mktype(TY_VOID,NULL,NULL);break;
         }

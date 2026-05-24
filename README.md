@@ -314,11 +314,13 @@ Escape sequences: `\n \t \r \0 \\ \"`.
 ### Imports
 
 ```falcon
-import "std"       # the standard library (virtual, no file needed)
+import "std"       # loads std.fl if found; otherwise uses Falcon's virtual std
 import "mylib"     # loads mylib.fl from the search path
 ```
 
 Use `-I<path>` to add directories to the search path. Imports are recursive and deduplicated automatically.
+
+Import resolution is based on the source file, not the compiler binary. Falcon first searches next to the file doing the import, then each `-I` path. If a real `std.fl` is found, it is compiled like an ordinary source file and does not automatically enable the built-in runtime. The virtual built-in `std` is used only when no real `std.fl` can be found.
 
 ---
 
@@ -361,7 +363,9 @@ Unknown external functions produce a warning and are assumed to return `void`.
 
 ## Standard library (`import "std"`)
 
-Importing `"std"` enables the `print()` built-in and links the Falcon runtime functions. No file is needed on disk — `std` is a virtual import.
+If no real `std.fl` is found, importing `"std"` enables the `print()` built-in and links the Falcon runtime functions. This fallback `std` is virtual, so no file is needed on disk.
+
+If a project or library provides its own `std.fl`, Falcon imports that file only. In that case names like `print` must come from the file itself or another linked object; the compiler will not treat them as built-in runtime calls automatically.
 
 ### print
 
@@ -377,7 +381,7 @@ print(1234567890L) # prints a long followed by a newline
 
 ### Runtime functions
 
-These are always available after `import "std"`. Call them directly by name.
+These are available when the virtual built-in `std` is active. Call them directly by name.
 
 | Function | Description |
 |----------|-------------|

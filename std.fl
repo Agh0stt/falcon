@@ -2,26 +2,28 @@
 # Thin wrappers over the _flr_* symbols in flr.o / flr.s.
 # Import with:  import "std"
 #
-# After import the compiler sets has_std=1 and inlines the runtime
-# (or links against flr.o when built separately).
+# A real std.fl is imported as normal Falcon source. Link flr.o if you call
+# these _flr_* runtime wrappers. If no std.fl is found, the compiler falls back
+# to its virtual built-in std and enables runtime-backed print().
 #
-# Available functions (all map 1-to-1 to _flr_* symbols):
+# Available functions (mostly thin wrappers over _flr_* symbols):
 
 # ── I/O ──────────────────────────────────────────────────────────────
 
 func print_str(s: str) -> void {
-    # Implemented by the compiler as a direct call to _flr_print_str.
-    # The compiler's N_EXPRSTMT / print special-case handles `print(s)`
-    # when the argument is a str type; this wrapper exists so user code
-    # can also call print_str() explicitly.
+    # Explicit string output wrapper. Runtime-backed print() is only magic when
+    # the virtual built-in std is used.
     __syscall(4, 1, s, str_len(s))  # sys_write fd=1 buf=s len
-    # newline is NOT appended here — use print() which calls _flr_print_str
+}
+
+func print(s: str) -> void {
+    print_str(s)
+    __syscall(4, 1, "\n", 1)
 }
 
 func print_int(n: int) -> void {
-    # Delegates to the runtime's digit-conversion + write path.
-    # The compiler already knows to call _flr_print_int for print(int),
-    # so this function is here for explicit calls.
+    # Explicit integer output wrapper. Runtime-backed print() is only magic when
+    # the virtual built-in std is used.
     __syscall(4, 1, int_to_str(n), str_len(int_to_str(n)))
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-FIXED=./falconc
+FIXED=${FIXED:-./falconc}
 FLR=./flr.o
 EXAMPLES=examples
 
@@ -8,7 +8,7 @@ pass=0; fail=0; fail_list=""
 
 for fl in $(ls $EXAMPLES/*.fl | sort); do
     name=$(basename $fl)
-    out=$($FIXED $fl -I. -o /tmp/t.s 2>/tmp/terr.txt && \
+    out=$($FIXED $fl -o /tmp/t.s 2>/tmp/terr.txt && \
           as --32 /tmp/t.s -o /tmp/t.o 2>>/tmp/terr.txt && \
           ld --allow-multiple-definition -m elf_i386 $FLR /tmp/t.o -o /tmp/t 2>>/tmp/terr.txt && \
           timeout 3 /tmp/t 2>&1 | head -10)
@@ -26,4 +26,9 @@ done
 
 echo ""
 echo "Results: $pass passed, $fail failed"
-[ -n "$fail_list" ] && echo "Failed:$fail_list"
+if [ -n "$fail_list" ]; then
+    echo "Failed:$fail_list"
+    exit 1
+fi
+
+exit 0

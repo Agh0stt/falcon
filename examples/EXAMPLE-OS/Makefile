@@ -1,13 +1,13 @@
 # Makefile — Falcon Hello World kernel
 
-FALCONC  = ../falconc
+FALCONC  = ../../falconc
 AS       = as --32
 LD       = ld -m elf_i386
 
 all: kernel.elf
 
 falconc:
-	gcc -O2 -o ../falconc ../falconc.c
+	gcc -O2 -o ../../falconc ../../falconc.c
 
 kernel.s: kernel.fl
 	$(FALCONC) kernel.fl --freestanding -o kernel.s
@@ -25,6 +25,6 @@ run: kernel.elf
 	qemu-system-i386 -kernel kernel.elf
 
 clean:
-	rm -f *.o *.s kernel.elf
+	rm -f *.o kernel.s kernel.elf
 
 .PHONY: all run clean falconc
