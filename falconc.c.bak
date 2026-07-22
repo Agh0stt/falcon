@@ -880,21 +880,6 @@ static Node *parse_program(void){
             Node *im=mknode(N_IMPORT,path->line);im->import_path=xstrdup(path->val);
             nl_push(&prog->body,im);
         }
-        /* top-level variable: name: type [= expr] */
-        else if(t==TT_IDENT){
-            int saved=gpos;advance();skip_nl();
-            if(check(TT_COLON)){
-                advance();skip_nl();
-                Node *n=mknode(N_VARDECL,peek()->line);n->name=xstrdup(gtoks[saved].val);
-                n->typeref=parse_type();skip_nl();
-                if(match(TT_ASSIGN)){skip_nl();n->left=parse_expr();}
-                n->is_const=2; /* sentinel: global */
-                nl_push(&prog->body,n);
-            } else {
-                gpos=saved;
-                die("%s:%d: unexpected top-level token '%s'",peek()->file,peek()->line,peek()->val);
-            }
-        }
         else die("%s:%d: unexpected top-level token '%s'",peek()->file,peek()->line,peek()->val);
     }
     return prog;
@@ -977,11 +962,6 @@ static TypeRef *find_tvar(const char *name){
     for(int i=ntvars-1;i>=0;i--)if(strcmp(tvars[i].name,name)==0)return tvars[i].type;
     return NULL;
 }
-
-/* ── global variables (declared here so typecheck can register them) ── */
-typedef struct{char *name;TypeRef *type;long long ival;int has_init;}GVar;
-static GVar gvars[4096];
-static int  ngvars=0;
 static void push_tvar(const char *name,TypeRef *t){
     if(ntvars>=4096)die("too many variables");
     tvars[ntvars].name=xstrdup(name);tvars[ntvars].type=t;tvars[ntvars].is_const=0;ntvars++;
@@ -1316,24 +1296,6 @@ static void typecheck(Node *prog){
             fsigs[nfsigs].params=n->params;
             nfsigs++;
         }
-        /* register top-level var declarations as globals in tvars so funcs can see them */
-        if(n->kind==N_VARDECL&&n->is_const==2){
-            TypeRef *vt=n->typeref;
-            if(!vt&&n->left){tc_expr(n->left,NULL);vt=n->left->etype;}
-            push_tvar(n->name,vt?vt:mktype(TY_INT,NULL,NULL));
-            /* also register into gvars for codegen */
-            if(ngvars<4096){
-                gvars[ngvars].name=xstrdup(n->name);
-                gvars[ngvars].type=vt;
-                gvars[ngvars].has_init=(n->left!=NULL);
-                /* extract literal value if it's a simple int/bool/long literal */
-                long long iv=0;
-                if(n->left&&(n->left->kind==N_INTLIT||n->left->kind==N_LONGLIT||n->left->kind==N_BOOLLIT))
-                    iv=n->left->ival;
-                gvars[ngvars].ival=iv;
-                ngvars++;
-            }
-        }
     }
     /* second pass: type-check each function body */
     for(int i=0;i<prog->body.n;i++){
@@ -1382,8 +1344,6 @@ static int add_flit(double v,int is_double){
 typedef struct{char *name;int offset;TypeRef *type;}Var;
 static Var  vars[4096];
 static int  nvars=0,frame_sz=0,lbl_cnt=0;
-
-
 static char break_lbl[64],cont_lbl[64];
 static int  has_std=0,freestanding=0;
 
@@ -1396,15 +1356,8 @@ static int arch=ARCH_X86_32;   /* default: 32-bit */
 static const char *argregs64[6]={"rdi","rsi","rdx","rcx","r8","r9"};
 
 static int   new_label(void){return lbl_cnt++;}
-static Var gvar_proxy; /* scratch slot to return a fake Var for globals */
 static Var  *find_var(const char *name){
-    for(int i=nvars-1;i>=0;i--)if(strcmp(vars[i].name,name)==0)return &vars[i];
-    /* fall back to globals — use sentinel offset -999999 */
-    for(int i=0;i<ngvars;i++)if(strcmp(gvars[i].name,name)==0){
-        gvar_proxy.name=gvars[i].name;gvar_proxy.offset=-999999-i;gvar_proxy.type=gvars[i].type;
-        return &gvar_proxy;
-    }
-    return NULL;
+    for(int i=nvars-1;i>=0;i--)if(strcmp(vars[i].name,name)==0)return &vars[i];return NULL;
 }
 static int alloc_var(const char *name,TypeRef *type){
     int sz;
@@ -1593,22 +1546,7 @@ static void gen_expr(Node *n){
     case N_IDENT:{
         Var *v=find_var(n->name);
         if(!v)die("%s:%d: undefined variable '%s'",n->file,n->line,n->name);
-        int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
-        if(gidx>=0){
-            /* global variable */
-            if(v->type&&v->type->kind==TY_FLOAT){
-                out("    flds _gv_%s\n",gvars[gidx].name);
-                out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
-            } else if(v->type&&v->type->kind==TY_DOUBLE){
-                out("    fldl _gv_%s\n",gvars[gidx].name);
-                out("    subl $8,%%esp\n    fstpl (%%esp)\n");
-                out("    popl %%eax\n    popl %%edx\n");
-            } else {
-                out("    movl _gv_%s,%%eax\n",gvars[gidx].name);
-                if(v->type&&v->type->kind==TY_LONG)
-                    out("    movl _gv_%s+4,%%edx\n",gvars[gidx].name);
-            }
-        } else if(v->type&&v->type->kind==TY_FLOAT){
+        if(v->type&&v->type->kind==TY_FLOAT){
             out("    flds %d(%%ebp)\n",v->offset);
             out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
         } else if(v->type&&v->type->kind==TY_DOUBLE){
@@ -1873,20 +1811,7 @@ static void gen_store(Node *lv){
     case N_IDENT:{
         Var *v=find_var(lv->name);
         if(!v)die("%s:%d: undefined variable '%s'",lv->file,lv->line,lv->name);
-        int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
-        if(gidx>=0){
-            if(v->type&&v->type->kind==TY_FLOAT){
-                out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-                out("    fstps _gv_%s\n",gvars[gidx].name);
-            } else if(v->type&&v->type->kind==TY_DOUBLE){
-                out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-                out("    fstpl _gv_%s\n",gvars[gidx].name);
-            } else {
-                out("    movl %%eax,_gv_%s\n",gvars[gidx].name);
-                if(v->type&&v->type->kind==TY_LONG)
-                    out("    movl %%edx,_gv_%s+4\n",gvars[gidx].name);
-            }
-        } else if(v->type&&v->type->kind==TY_FLOAT){
+        if(v->type&&v->type->kind==TY_FLOAT){
             out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
             out("    fstps %d(%%ebp)\n",v->offset);
         } else if(v->type&&v->type->kind==TY_DOUBLE){
@@ -2015,15 +1940,15 @@ static void gen_stmt(Node *n){
     case N_IF:{
         int lend=new_label(),lnext=new_label();
         gen_expr(n->cond);out("    testl %%eax,%%eax\n    je .Lif%d\n",lnext);
-        {int sv=nvars;for(int i=0;i<n->body.n;i++)gen_stmt(n->body.d[i]);nvars=sv;}
+        for(int i=0;i<n->body.n;i++)gen_stmt(n->body.d[i]);
         out("    jmp .Lif%d\n.Lif%d:\n",lend,lnext);
         for(int ei=0;ei<n->elifs.n;ei++){
             ElifClause *ec=&n->elifs.d[ei];int ln2=new_label();
             gen_expr(ec->cond);out("    testl %%eax,%%eax\n    je .Lif%d\n",ln2);
-            {int sv=nvars;for(int i=0;i<ec->body.n;i++)gen_stmt(ec->body.d[i]);nvars=sv;}
+            for(int i=0;i<ec->body.n;i++)gen_stmt(ec->body.d[i]);
             out("    jmp .Lif%d\n.Lif%d:\n",lend,ln2);
         }
-        {int sv=nvars;for(int i=0;i<n->else_body.n;i++)gen_stmt(n->else_body.d[i]);nvars=sv;}
+        for(int i=0;i<n->else_body.n;i++)gen_stmt(n->else_body.d[i]);
         out(".Lif%d:\n",lend);break;
     }
     case N_WHILE:{
@@ -2031,7 +1956,7 @@ static void gen_stmt(Node *n){
         char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
         snprintf(break_lbl,64,".Lwh%d",le);snprintf(cont_lbl,64,".Lwh%d",ls);
         out(".Lwh%d:\n",ls);gen_expr(n->cond);out("    testl %%eax,%%eax\n    je .Lwh%d\n",le);
-        {int sv=nvars;for(int i=0;i<n->body.n;i++)gen_stmt(n->body.d[i]);nvars=sv;}
+        for(int i=0;i<n->body.n;i++)gen_stmt(n->body.d[i]);
         out("    jmp .Lwh%d\n.Lwh%d:\n",ls,le);
         strcpy(break_lbl,ob);strcpy(cont_lbl,oc);break;
     }
@@ -2039,11 +1964,11 @@ static void gen_stmt(Node *n){
         int ls=new_label(),le=new_label(),lp=new_label();
         char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
         snprintf(break_lbl,64,".Lfor%d",le);snprintf(cont_lbl,64,".Lfor%d",lp);
-        {int sv=nvars;gen_stmt(n->for_init);
+        gen_stmt(n->for_init);
         out(".Lfor%d:\n",ls);gen_expr(n->cond);out("    testl %%eax,%%eax\n    je .Lfor%d\n",le);
         for(int i=0;i<n->body.n;i++)gen_stmt(n->body.d[i]);
         out(".Lfor%d:\n",lp);gen_stmt(n->for_post);
-        out("    jmp .Lfor%d\n.Lfor%d:\n",ls,le);nvars=sv;}
+        out("    jmp .Lfor%d\n.Lfor%d:\n",ls,le);
         strcpy(break_lbl,ob);strcpy(cont_lbl,oc);break;
     }
     case N_BREAK:
@@ -3204,17 +3129,6 @@ static void emit_data(void){
         }
     }
     out(".Lfl_zero:\n    .long 0\n    .long 0\n");
-    /* emit global variables */
-    if(ngvars>0){
-        out(".section .data\n");
-        for(int i=0;i<ngvars;i++){
-            int sz=4;
-            if(gvars[i].type&&(gvars[i].type->kind==TY_LONG||gvars[i].type->kind==TY_DOUBLE))sz=8;
-            out(".globl _gv_%s\n_gv_%s:\n",gvars[i].name,gvars[i].name);
-            if(sz==8)out("    .quad %lld\n",(long long)gvars[i].ival);
-            else     out("    .long %d\n",(int)gvars[i].ival);
-        }
-    }
 }
 
 static void codegen(Node *prog){
