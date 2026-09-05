@@ -223,6 +223,15 @@ static void tokenize(const char *src,const char *filename){
             emit_tok(is_long?TT_LONG_LIT:TT_INT_LIT,s,line,file);
             free(s);i=j+(is_long?1:0);continue;
         }
+        /* binary literal */
+        if(c=='0'&&i+1<n&&(src[i+1]=='b'||src[i+1]=='B')){
+            int j=i+2;while(j<n&&(src[j]=='0'||src[j]=='1'))j++;
+            if(j==i+2)die("%s:%d: invalid binary literal (no digits after 0b)",file,line);
+            int is_long=(j<n&&(src[j]=='L'||src[j]=='l'));
+            char *s=xstrndup(src+i,j-i);
+            emit_tok(is_long?TT_LONG_LIT:TT_INT_LIT,s,line,file);
+            free(s);i=j+(is_long?1:0);continue;
+        }
         /* decimal / float / double */
         if(isdigit(c)||(c=='.'&&i+1<n&&isdigit((unsigned char)src[i+1]))){
             int j=i;
@@ -432,13 +441,15 @@ static int types_compat(TypeRef *a,TypeRef *b){
     if((a->kind==TY_FLOAT||a->kind==TY_DOUBLE)&&(b->kind==TY_INT||b->kind==TY_LONG))return 1;
     /* bool <-> int allowed */
     if((a->kind==TY_INT||a->kind==TY_BOOL)&&(b->kind==TY_INT||b->kind==TY_BOOL))return 1;
-    /* struct vars are heap pointers: allow int/ptr on rhs (e.g. _flr_alloc return) */
-    if(a->kind==TY_STRUCT&&(b->kind==TY_INT||b->kind==TY_PTR))return 1;
-    /* ptr <-> int interchangeable */
-    if((a->kind==TY_PTR||a->kind==TY_INT)&&(b->kind==TY_PTR||b->kind==TY_INT))return 1;
-    /* str <-> int/ptr: str is just a char pointer, allow for bare-metal */
-    if((a->kind==TY_STR)&&(b->kind==TY_INT||b->kind==TY_PTR))return 1;
-    if((b->kind==TY_STR)&&(a->kind==TY_INT||a->kind==TY_PTR))return 1;
+    /* struct vars are heap pointers: allow int/long/ptr on rhs (e.g. _flr_alloc
+       return, which is TY_LONG on x86-64 so it isn't truncated — see
+       builtin_rettype) */
+    if(a->kind==TY_STRUCT&&(b->kind==TY_INT||b->kind==TY_LONG||b->kind==TY_PTR))return 1;
+    /* ptr <-> int/long interchangeable */
+    if((a->kind==TY_PTR||a->kind==TY_INT||a->kind==TY_LONG)&&(b->kind==TY_PTR||b->kind==TY_INT||b->kind==TY_LONG))return 1;
+    /* str <-> int/long/ptr: str is just a char pointer, allow for bare-metal */
+    if((a->kind==TY_STR)&&(b->kind==TY_INT||b->kind==TY_LONG||b->kind==TY_PTR))return 1;
+    if((b->kind==TY_STR)&&(a->kind==TY_INT||a->kind==TY_LONG||a->kind==TY_PTR))return 1;
     return 0;
 }
 
@@ -556,6 +567,8 @@ static Node *parse_primary(void){
         advance();Node *n=mknode(N_LONGLIT,t->line);
         if(t->val[0]=='0'&&(t->val[1]=='x'||t->val[1]=='X'))
             n->ival=(long long)strtoll(t->val,NULL,16);
+        else if(t->val[0]=='0'&&(t->val[1]=='b'||t->val[1]=='B'))
+            n->ival=(long long)strtoll(t->val+2,NULL,2);
         else n->ival=atoll(t->val);
         return n;
     }
@@ -571,6 +584,8 @@ static Node *parse_primary(void){
         advance();Node *n=mknode(N_INTLIT,t->line);
         if(t->val[0]=='0'&&(t->val[1]=='x'||t->val[1]=='X'))
             n->ival=(long long)strtoll(t->val,NULL,16);
+        else if(t->val[0]=='0'&&(t->val[1]=='b'||t->val[1]=='B'))
+            n->ival=(long long)strtoll(t->val+2,NULL,2);
         else n->ival=atoll(t->val);
         return n;
     }
@@ -979,7 +994,7 @@ static TypeRef *find_tvar(const char *name){
 }
 
 /* ── global variables (declared here so typecheck can register them) ── */
-typedef struct{char *name;TypeRef *type;long long ival;int has_init;}GVar;
+typedef struct{char *name;TypeRef *type;long long ival;double dval;int has_init;}GVar;
 static GVar gvars[4096];
 static int  ngvars=0;
 static void push_tvar(const char *name,TypeRef *t){
@@ -992,6 +1007,35 @@ static void push_tvar_const(const char *name,TypeRef *t){
 }
 
 static TypeRef *tc_expr(Node *n,TypeRef *expected_ret);
+
+/* ── architecture selection ──────────────────────────────────────── */
+#define ARCH_X86_32 32
+#define ARCH_X86_64 64
+static int arch=ARCH_X86_32;   /* default: 32-bit; set from argv before typecheck() runs */
+
+/* ── KNOWN, INTENTIONAL x86-32 vs x86-64 SEMANTIC DIFFERENCE ────────
+   `int` arithmetic does NOT wrap/truncate at 32 bits on the x86-64
+   target the way it naturally does on x86-32 (where results simply
+   live in eax). On x86-64 every value — regardless of whether its
+   Falcon type is `int` or `long` — is computed and stored in a full
+   64-bit register/slot with no truncation, so e.g. `1 << 31` as an
+   `int` yields 2147483648 on x86-64 but the C-correct -2147483648
+   (INT32_MIN) on x86-32.
+
+   This is NOT safely fixable as a narrow codegen patch: this language
+   has no separate pointer type, so `int` is also the type used for
+   every heap address (_flr_alloc's return, and by extension every
+   struct field, array element, and __peek/__poke offset computation
+   done through an `int`-typed base pointer). On x86-64 those
+   addresses are real 48-bit-ish values from mmap(). Truncating every
+   `int`-typed arithmetic result to 32 bits to fix the overflow
+   semantics would silently corrupt that pointer arithmetic instead —
+   trading a rare int-overflow edge case for pervasive breakage across
+   every pointer-using program. Fixing this properly means introducing
+   a real pointer type distinct from `int` (a language/type-system
+   change, not a codegen bug fix). Left as documented, known behavior
+   per an explicit decision — do not "fix" this with blanket
+   truncation in gen_expr64's N_BINOP without that larger change. */
 
 /* return type of a builtin/runtime call; NULL means "not a known builtin" */
 static TypeRef *builtin_rettype(const char *name){
@@ -1007,7 +1051,11 @@ static TypeRef *builtin_rettype(const char *name){
     if(strcmp(name,"_flr_abs")==0)           return mktype(TY_INT,NULL,NULL);
     if(strcmp(name,"_flr_min")==0||
        strcmp(name,"_flr_max")==0)           return mktype(TY_INT,NULL,NULL);
-    if(strcmp(name,"_flr_alloc")==0)         return mktype(TY_INT,NULL,NULL);
+    /* _flr_alloc returns a heap pointer straight out of mmap()/sbrk(); it must be
+       typed at native pointer width for the target, or a 64-bit heap address
+       gets truncated the moment it's assigned to a var (see emit_data's global
+       sizing, which allocates .long for TY_INT and .quad for TY_LONG). */
+    if(strcmp(name,"_flr_alloc")==0)         return mktype(arch==ARCH_X86_64?TY_LONG:TY_INT,NULL,NULL);
     if(strcmp(name,"_flr_free")==0)          return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"_flr_exit")==0)          return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"_flr_assert")==0)        return mktype(TY_VOID,NULL,NULL);
@@ -1326,11 +1374,17 @@ static void typecheck(Node *prog){
                 gvars[ngvars].name=xstrdup(n->name);
                 gvars[ngvars].type=vt;
                 gvars[ngvars].has_init=(n->left!=NULL);
-                /* extract literal value if it's a simple int/bool/long literal */
-                long long iv=0;
+                /* extract literal value if it's a simple int/bool/long/float/
+                   double literal (only compile-time-constant initializers are
+                   supported; anything else stays zero and must be assigned
+                   at runtime, as with e.g. a heap pointer from _flr_alloc) */
+                long long iv=0;double dv=0.0;
                 if(n->left&&(n->left->kind==N_INTLIT||n->left->kind==N_LONGLIT||n->left->kind==N_BOOLLIT))
                     iv=n->left->ival;
+                else if(n->left&&(n->left->kind==N_FLOATLIT||n->left->kind==N_DOUBLELIT))
+                    dv=n->left->dval;
                 gvars[ngvars].ival=iv;
+                gvars[ngvars].dval=dv;
                 ngvars++;
             }
         }
@@ -1387,11 +1441,6 @@ static int  nvars=0,frame_sz=0,lbl_cnt=0;
 static char break_lbl[64],cont_lbl[64];
 static int  has_std=0,freestanding=0;
 
-/* ── architecture selection ──────────────────────────────────────── */
-#define ARCH_X86_32 32
-#define ARCH_X86_64 64
-static int arch=ARCH_X86_32;   /* default: 32-bit */
-
 /* x86-64 System V AMD64 ABI integer argument registers (in order) */
 static const char *argregs64[6]={"rdi","rsi","rdx","rcx","r8","r9"};
 
@@ -1431,6 +1480,11 @@ static int long_helpers_emitted=0;
 static void need_long_helpers(void){
     if(long_helpers_emitted)return;
     long_helpers_emitted=1;
+    /* These helpers may be emitted mid-function (wherever the first long
+       operation is first compiled), so jump over their bodies — otherwise
+       straight-line code falls through into _flr_ladd and hits its `ret`
+       with no call on the stack. */
+    out("    jmp .Lflr_long_helpers_end\n");
     /* _flr_ladd(alo,ahi,blo,bhi) -> edx:eax */
     out("_flr_ladd:\n");
     out("    movl 4(%%esp),%%eax\n    movl 8(%%esp),%%edx\n");
@@ -1451,6 +1505,26 @@ static void need_long_helpers(void){
     out("    mull %%edx\n");        /* alo*blo -> edx:eax */
     out("    addl %%ecx,%%edx\n    addl %%esi,%%edx\n");
     out("    addl $16,%%esp\n    leave\n    ret\n\n");
+    /* _flr_lshl(alo,ahi,cntlo,cnthi) -> edx:eax — 64-bit left shift by a
+       variable 0-63 count, using the standard shld+shl double-shift
+       technique (count_hi is ignored: only the low 6 bits of the count
+       matter, same as any x86 shift). */
+    out("_flr_lshl:\n");
+    out("    movl 4(%%esp),%%eax\n    movl 8(%%esp),%%edx\n    movl 12(%%esp),%%ecx\n");
+    out("    andl $63,%%ecx\n");
+    out("    shldl %%cl,%%eax,%%edx\n    shll %%cl,%%eax\n");
+    out("    testb $32,%%cl\n    je .Llshl_done\n");
+    out("    movl %%eax,%%edx\n    xorl %%eax,%%eax\n");
+    out(".Llshl_done:\n    ret\n\n");
+    /* _flr_lshr(alo,ahi,cntlo,cnthi) -> edx:eax — 64-bit ARITHMETIC right
+       shift (Falcon's `long` is signed), same variable-count technique. */
+    out("_flr_lshr:\n");
+    out("    movl 4(%%esp),%%eax\n    movl 8(%%esp),%%edx\n    movl 12(%%esp),%%ecx\n");
+    out("    andl $63,%%ecx\n");
+    out("    shrdl %%cl,%%edx,%%eax\n    sarl %%cl,%%edx\n");
+    out("    testb $32,%%cl\n    je .Llshr_done\n");
+    out("    movl %%edx,%%eax\n    sarl $31,%%edx\n");
+    out(".Llshr_done:\n    ret\n\n");
     /* _flr_lprint(lo,hi) — print signed 64-bit integer */
     out("_flr_lprint:\n");
     out("    pushl %%ebp\n    movl %%esp,%%ebp\n");
@@ -1473,7 +1547,18 @@ static void need_long_helpers(void){
     out("    movl (%%esp),%%eax\n    divl %%ecx\n"); /* lo/10, edx=rem */
     out("    popl %%ecx\n    popl %%ecx\n");   /* discard saved */
     out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n");
-    out("    orl %%ebx,%%eax\n    je .Llpr_done\n    movl %%ebx,%%edx\n");
+    /* Loop-termination check must be non-destructive: `orl %ebx,%eax` looks
+       like a harmless zero-test but it's a real OR — it overwrites eax with
+       the OR result, corrupting the quotient_lo value that must carry into
+       the next iteration as the new "lo". This was invisible for any long
+       value small enough that the high word (and thus ebx) stayed zero for
+       the whole computation — ORing with 0 is a no-op — which is every
+       value the existing test suite happened to use. It corrupts any value
+       that actually spans into the high 32 bits. edx is safe to use as a
+       throwaway copy here: its digit value was already written to memory
+       above, and it's unconditionally overwritten by `movl %ebx,%edx` right
+       below if the loop continues, or left unused if it doesn't. */
+    out("    movl %%eax,%%edx\n    orl %%ebx,%%edx\n    je .Llpr_done\n    movl %%ebx,%%edx\n");
     out("    jmp .Llpr_l\n");
     out(".Llpr_done:\n");
     out("    testl %%esi,%%esi\n    je .Llpr_nomin\n");
@@ -1481,8 +1566,8 @@ static void need_long_helpers(void){
     out(".Llpr_nomin:\n    incl %%edi\n");
     out("    leal .Lflr_ibuf+24,%%edx\n    subl %%edi,%%edx\n    movl %%edi,%%ecx\n");
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
-    out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_nl,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
+    out(".Lflr_long_helpers_end:\n");
 }
 
 /* push a long variable: pushes hi then lo (so lo is at lower address on stack) */
@@ -1710,6 +1795,10 @@ static void gen_expr(Node *n){
                 out("    call _flr_lsub\n    addl $16,%%esp\n");
             }else if(strcmp(op,"*")==0){
                 out("    call _flr_lmul\n    addl $16,%%esp\n");
+            }else if(strcmp(op,"<<")==0){
+                out("    call _flr_lshl\n    addl $16,%%esp\n");
+            }else if(strcmp(op,">>")==0){
+                out("    call _flr_lshr\n    addl $16,%%esp\n");
             }else{
                 /* comparison: compare hi then lo */
                 out("    popl %%eax\n    popl %%edx\n"); /* lhs lo,hi */
@@ -1775,7 +1864,19 @@ static void gen_expr(Node *n){
     }
     case N_UNOP:
         gen_expr(n->left);
-        if     (strcmp(n->op,"-"  )==0)out("    negl %%eax\n");
+        if(strcmp(n->op,"-")==0&&n->etype&&n->etype->kind==TY_LONG){
+            out("    negl %%eax\n    adcl $0,%%edx\n    negl %%edx\n");
+        }
+        else if(strcmp(n->op,"-")==0&&n->etype&&n->etype->kind==TY_FLOAT){
+            /* eax holds the raw 32-bit IEEE-754 bit pattern; flip the sign bit */
+            out("    xorl $0x80000000,%%eax\n");
+        }
+        else if(strcmp(n->op,"-")==0&&n->etype&&n->etype->kind==TY_DOUBLE){
+            /* edx:eax holds the raw 64-bit IEEE-754 bit pattern (edx = high dword);
+               the sign bit lives in edx's top bit, eax is untouched */
+            out("    xorl $0x80000000,%%edx\n");
+        }
+        else if     (strcmp(n->op,"-"  )==0)out("    negl %%eax\n");
         else if(strcmp(n->op,"~"  )==0)out("    notl %%eax\n");
         else if(strcmp(n->op,"not")==0){out("    testl %%eax,%%eax\n");out("    sete %%al\n");out("    movzbl %%al,%%eax\n");}
         break;
@@ -2098,16 +2199,24 @@ static void gen_func(Node *fn){
 
 /* ── runtime (inlined when hosted + has_std) ────────────────────── */
 static void emit_runtime(void){
+    /* The ELF entry point must exist for any hosted (non-freestanding)
+       program regardless of whether it uses Falcon's virtual std runtime —
+       has_std only controls whether the runtime *helper* functions below
+       (print_int, memcpy, etc.) get emitted. A project supplying its own
+       std.fl (has_std==0, freestanding==0) still needs _start, or the
+       linker has no entry point and the binary can't run at all.
+       Freestanding programs supply their own _start via an external boot
+       stub (see examples/EXAMPLE-OS/boot.s), so this must stay silent then. */
+    if(!freestanding){
+        out(".globl _start\n_start:\n");
+        out("    xorl %%ebp,%%ebp\n");
+        out("    call main\n");
+        out("    movl %%eax,%%ebx\n");
+        out("    movl $1,%%eax\n");
+        out("    int $0x80\n\n");
+    }
     if(!has_std||freestanding)return;
     out("# ── Falcon Runtime (inline) ───────────────────────────\n");
-    /* ELF entry point */
-    out(".globl _start\n_start:\n");
-    out("    xorl %%ebp,%%ebp\n");
-    out("    call main\n");
-    out("    movl %%eax,%%ebx\n");
-    out("    movl $1,%%eax\n");
-    out("    int $0x80\n\n");
-
     /* memset / memcpy */
     out("_flr_memset:\n    pushl %%ebp\n    movl %%esp,%%ebp\n    pushl %%edi\n");
     out("    movl 8(%%ebp),%%edi\n    movl 12(%%ebp),%%eax\n    movl 16(%%ebp),%%ecx\n");
@@ -2169,16 +2278,37 @@ static void emit_runtime(void){
     /* print minus */
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_minus,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
     out(".Lfpd_pos:\n");
+    /* fistpl defaults to round-to-nearest, which is wrong for print (3.6
+       would print as "4...", not "3..."). Switch to truncate-toward-zero
+       for both integer-part extractions, then restore before the final
+       fractional-digit rounding below. */
+    out("    subl $4,%%esp\n    fnstcw (%%esp)\n    movw (%%esp),%%ax\n");
+    out("    orw $0x0C00,%%ax\n    movw %%ax,2(%%esp)\n    fldcw 2(%%esp)\n");
     /* get integer part via fist */
     out("    fld %%st(0)\n");
     out("    subl $4,%%esp\n    fistpl (%%esp)\n    popl %%eax\n");
-    out("    pushl %%eax\n    call _flr_print_int\n    addl $4,%%esp\n");
+    /* print integer part digits WITHOUT a trailing newline (can't reuse
+       _flr_print_int here — it always appends one, which would split
+       the number in the middle) */
+    out("    leal .Lflr_ibuf+11,%%edi\n");
+    out("    testl %%eax,%%eax\n    jge .Lfpd_int_pos\n    negl %%eax\n    movl $1,%%esi\n    jmp .Lfpd_int_l\n");
+    out(".Lfpd_int_pos:\n    xorl %%esi,%%esi\n");
+    out(".Lfpd_int_l:\n    movl $10,%%ecx\n    xorl %%edx,%%edx\n    divl %%ecx\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n");
+    out("    testl %%eax,%%eax\n    jne .Lfpd_int_l\n");
+    out("    testl %%esi,%%esi\n    je .Lfpd_int_nom\n    movb $45,(%%edi)\n    decl %%edi\n");
+    out(".Lfpd_int_nom:\n    incl %%edi\n");
+    out("    leal .Lflr_ibuf+12,%%edx\n    subl %%edi,%%edx\n    movl %%edi,%%ecx\n");
+    out("    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
     /* print decimal point */
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_dot,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
-    /* subtract integer part from float to get fraction */
+    /* subtract integer part from float to get fraction (still truncate mode,
+       so this matches the integer part that was just printed) */
     out("    fld %%st(0)\n");
     out("    subl $4,%%esp\n    fistpl (%%esp)\n    filds (%%esp)\n    addl $4,%%esp\n");
     out("    fsubrp\n");
+    /* restore original rounding mode for the fractional digits below */
+    out("    fldcw (%%esp)\n    addl $4,%%esp\n");
     /* multiply fraction by 1000000, round to int, print 6 digits */
     out("    fldl .Lflr_1e6\n    fmulp\n");
     out("    subl $4,%%esp\n    fistpl (%%esp)\n    popl %%eax\n");
@@ -2325,26 +2455,37 @@ static void emit_runtime(void){
     out(".Lsfmt_d:\n");
     out("    incl %%esi\n");
     out("    testl %%ecx,%%ecx\n    je .Lsfmt_l\n");
-    out("    pushl %%ecx\n    pushl %%esi\n    pushl %%edi\n    pushl %%ebx\n");
+    /* Only esi (repurposed below as a scratch walk pointer) needs saving —
+       ebx/ecx/edi must advance PERMANENTLY (next arg, remaining count,
+       output write position) rather than being rewound after the
+       substitution, which was the original bug: it silently discarded
+       every substituted value and never advanced past the first arg. ecx
+       specifically must be saved/restored around the call because
+       _flr_int_to_str clobbers it internally (it's caller-saved by
+       convention); ebx and edi are left alone since int_to_str doesn't
+       touch them. */
+    out("    pushl %%esi\n");
     out("    movl (%%ebx),%%eax\n    addl $4,%%ebx\n    decl %%ecx\n");
+    out("    pushl %%ecx\n");
     out("    pushl %%eax\n    call _flr_int_to_str\n    addl $4,%%esp\n");
+    out("    popl %%ecx\n");
     /* copy int string into output */
     out("    movl %%eax,%%esi\n");
     out(".Lsfmt_dc:\n    movzbl (%%esi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt_dr\n");
     out("    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_dc\n");
     out(".Lsfmt_dr:\n");
-    out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    popl %%ecx\n");
+    out("    popl %%esi\n");
     out("    jmp .Lsfmt_l\n");
     /* %s */
     out(".Lsfmt_s:\n");
     out("    incl %%esi\n");
     out("    testl %%ecx,%%ecx\n    je .Lsfmt_l\n");
-    out("    pushl %%ecx\n    pushl %%esi\n    pushl %%edi\n    pushl %%ebx\n");
+    out("    pushl %%esi\n");
     out("    movl (%%ebx),%%esi\n    addl $4,%%ebx\n    decl %%ecx\n");
     out(".Lsfmt_sc:\n    movzbl (%%esi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt_sr\n");
     out("    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_sc\n");
     out(".Lsfmt_sr:\n");
-    out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    popl %%ecx\n");
+    out("    popl %%esi\n");
     out("    jmp .Lsfmt_l\n");
     /* plain copy */
     out(".Lsfmt_copy:\n    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_l\n");
@@ -2368,6 +2509,16 @@ static void gen_store64(Node *lv){
     case N_IDENT:{
         Var *v=find_var(lv->name);
         if(!v)die("%s:%d: undefined variable '%s'",lv->file,lv->line,lv->name);
+        int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
+        if(gidx>=0){
+            if(v->type&&(v->type->kind==TY_FLOAT))
+                out("    movss %%xmm0,_gv_%s(%%rip)\n",gvars[gidx].name);
+            else if(v->type&&(v->type->kind==TY_DOUBLE))
+                out("    movsd %%xmm0,_gv_%s(%%rip)\n",gvars[gidx].name);
+            else
+                out("    movq %%rax,_gv_%s(%%rip)\n",gvars[gidx].name);
+            break;
+        }
         if(v->type&&(v->type->kind==TY_FLOAT)){
             out("    movss %%xmm0,%d(%%rbp)\n",v->offset);
         } else if(v->type&&(v->type->kind==TY_DOUBLE)){
@@ -2428,11 +2579,16 @@ static void gen_intrinsic64(Node *n){
     if(strcmp(nm,"__hlt")==0){out("    hlt\n    xorl %%eax,%%eax\n");return;}
     if(strcmp(nm,"__rdtsc")==0){out("    rdtsc\n    shlq $32,%%rdx\n    orq %%rdx,%%rax\n");return;}
     if(strcmp(nm,"__peek")==0){
-        gen_expr64(n->args.d[0]);out("    movq (%%rax),%%rax\n");return;
+        /* Falcon's `int` is signed — sign-extend the 4-byte cell into the
+           64-bit result register (movslq), matching how the 32-bit backend's
+           plain 32-bit eax naturally behaves as a signed value on print. A
+           zero-extending movl here would turn negative peeked ints (e.g.
+           0xDEADBEEF) into large positive 64-bit values instead. */
+        gen_expr64(n->args.d[0]);out("    movslq (%%rax),%%rax\n");return;
     }
     if(strcmp(nm,"__poke")==0){
         gen_expr64(n->args.d[1]);out("    pushq %%rax\n");
-        gen_expr64(n->args.d[0]);out("    popq %%rcx\n    movq %%rcx,(%%rax)\n    xorl %%eax,%%eax\n");return;
+        gen_expr64(n->args.d[0]);out("    popq %%rcx\n    movl %%ecx,(%%rax)\n    xorl %%eax,%%eax\n");return;
     }
     if(strcmp(nm,"__peekb")==0){
         gen_expr64(n->args.d[0]);out("    movzbl (%%rax),%%eax\n");return;
@@ -2485,6 +2641,20 @@ static void gen_expr64(Node *n){
     case N_IDENT:{
         Var *v=find_var(n->name);
         if(!v)die("%s:%d: undefined variable '%s'",n->file,n->line,n->name);
+        int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
+        if(gidx>=0){
+            /* global: address the .data symbol directly (RIP-relative),
+               not (%rbp) — v->offset here is a sentinel, not a real
+               stack offset. Every global is a full 8-byte quad on
+               x86-64 (see emit_data), except float/double. */
+            if(v->type&&v->type->kind==TY_FLOAT)
+                out("    movss _gv_%s(%%rip),%%xmm0\n",gvars[gidx].name);
+            else if(v->type&&v->type->kind==TY_DOUBLE)
+                out("    movsd _gv_%s(%%rip),%%xmm0\n",gvars[gidx].name);
+            else
+                out("    movq _gv_%s(%%rip),%%rax\n",gvars[gidx].name);
+            break;
+        }
         if(v->type&&v->type->kind==TY_FLOAT){
             out("    movss %d(%%rbp),%%xmm0\n",v->offset);
         } else if(v->type&&v->type->kind==TY_DOUBLE){
@@ -2607,7 +2777,15 @@ static void gen_expr64(Node *n){
     }
     case N_UNOP:
         gen_expr64(n->left);
-        if     (!strcmp(n->op,"-"))  out("    negq %%rax\n");
+        if(!strcmp(n->op,"-")&&n->etype&&n->etype->kind==TY_FLOAT){
+            /* float lives in xmm0; there's no direct SSE negate, so
+               compute 0.0 - xmm0 via a scratch register */
+            out("    pxor %%xmm1,%%xmm1\n    subss %%xmm0,%%xmm1\n    movaps %%xmm1,%%xmm0\n");
+        }
+        else if(!strcmp(n->op,"-")&&n->etype&&n->etype->kind==TY_DOUBLE){
+            out("    pxor %%xmm1,%%xmm1\n    subsd %%xmm0,%%xmm1\n    movapd %%xmm1,%%xmm0\n");
+        }
+        else if     (!strcmp(n->op,"-"))  out("    negq %%rax\n");
         else if(!strcmp(n->op,"~"))  out("    notq %%rax\n");
         else if(!strcmp(n->op,"not")){out("    testq %%rax,%%rax\n");out("    sete %%al\n");out("    movzbq %%al,%%rax\n");}
         break;
@@ -2923,16 +3101,18 @@ static void gen_func64(Node *fn){
 
 /* ── 64-bit runtime ──────────────────────────────────────────────── */
 static void emit_runtime64(void){
+    /* Same rationale as emit_runtime() above: _start must exist for any
+       hosted program regardless of has_std. */
+    if(!freestanding){
+        out(".globl _start\n_start:\n");
+        out("    xorl %%ebp,%%ebp\n");
+        out("    call main\n");
+        out("    movl %%eax,%%edi\n");
+        out("    movl $60,%%eax\n");
+        out("    syscall\n\n");
+    }
     if(!has_std||freestanding)return;
     out("# ── Falcon Runtime 64-bit (inline) ───────────────────────────\n");
-    /* ELF entry point */
-    out(".globl _start\n_start:\n");
-    out("    xorl %%ebp,%%ebp\n");
-    out("    call main\n");
-    out("    movl %%eax,%%edi\n");
-    out("    movl $60,%%eax\n");
-    out("    syscall\n\n");
-
     /* memset(ptr:rdi, val:rsi, n:rdx) */
     out("_flr_memset:\n");
     out("    movq %%rdi,%%rax\n    movq %%rdx,%%rcx\n    movb %%sil,%%al\n");
@@ -2971,8 +3151,6 @@ static void emit_runtime64(void){
     out(".Lfpi64_nom:\n    incq %%r12\n");
     out("    leaq .Lflr_ibuf+23(%%rip),%%rdx\n    subq %%r12,%%rdx\n");
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    syscall\n");
-    /* newline */
-    out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
     out("    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
 
     /* exit(code:rdi) */
@@ -2997,11 +3175,19 @@ static void emit_runtime64(void){
     out("    cvttsd2si %%xmm0,%%rdi\n    call _flr_print_int_nonl\n");
     /* decimal point */
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_dot(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
-    /* fraction: (val - floor(val)) * 1e6, print 6 digits */
+    /* fraction: (val - floor(val)) * 1e6, print 6 digits.
+       Use cvtsd2si (round-to-nearest, per MXCSR default) here, not
+       cvttsd2si (always truncates) — truncating this step is what caused
+       3.14159 to print as 3.141589 instead of 3.141590: the double's
+       stored bit pattern is a hair under the decimal value, so the
+       final digit needs to round up, matching what the 32-bit x87
+       implementation already does deliberately (it truncates only for
+       the integer-part extractions, then restores round-to-nearest for
+       this final digit computation). */
     out("    cvttsd2si %%xmm0,%%rax\n    cvtsi2sdq %%rax,%%xmm1\n");
     out("    subsd %%xmm1,%%xmm0\n");
     out("    movsd .Lflr_1e6(%%rip),%%xmm1\n    mulsd %%xmm1,%%xmm0\n");
-    out("    cvttsd2si %%xmm0,%%rax\n    testq %%rax,%%rax\n    jge .Lfpd64_fpos\n    negq %%rax\n");
+    out("    cvtsd2si %%xmm0,%%rax\n    testq %%rax,%%rax\n    jge .Lfpd64_fpos\n    negq %%rax\n");
     out(".Lfpd64_fpos:\n");
     /* print 6 zero-padded decimal digits */
     out("    leaq .Lflr_ibuf+12(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
@@ -3028,7 +3214,7 @@ static void emit_runtime64(void){
     out("    testq %%r13,%%r13\n    je .Lpni64_nom\n");
     out("    movb $45,(%%r12)\n    decq %%r12\n");
     out(".Lpni64_nom:\n    incq %%r12\n");
-    out("    leaq .Lflr_ibuf+23(%%rip),%%rdx\n    subq %%r12,%%rdx\n");
+    out("    leaq .Lflr_ibuf+22(%%rip),%%rdx\n    subq %%r12,%%rdx\n");
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    syscall\n");
     out("    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
 
@@ -3128,7 +3314,7 @@ static void emit_runtime64(void){
     out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%r15\n");
     out("    movq %%rdi,%%r12\n");   /* fmt */
     out("    movq %%rsi,%%r13\n");   /* nargs */
-    out("    leaq 16(%%rsp),%%r14\n"); /* &arg0 on stack (after pushes) — caller put them above ret addr */
+    out("    leaq 48(%%rsp),%%r14\n"); /* &arg0 on stack: 5 pushq (40) + return addr (8) = 48 */
     /* alloc 512 output bytes */
     out("    movq $512,%%rdi\n    call _flr_alloc\n");
     out("    movq %%rax,%%r15\n    pushq %%rax\n"); /* save output ptr */
@@ -3144,21 +3330,25 @@ static void emit_runtime64(void){
     /* %d */
     out(".Lsfmt64_d:\n    incq %%r12\n");
     out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
-    out("    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%rbx\n");
+    /* r13 (remaining count), r14 (arg ptr), rbx (output ptr) must advance
+       PERMANENTLY into the next loop iteration. _flr_int_to_str already
+       properly callee-saves rbx/r12 itself and never touches r13/r14/rsi,
+       so none of them need saving here — the original push/pop-everything
+       wrapper was actively wrong: it silently discarded every substituted
+       value and the arg pointer never advanced past arg 0. */
     out("    movq (%%r14),%%rdi\n    addq $8,%%r14\n    decq %%r13\n");
     out("    call _flr_int_to_str\n    movq %%rax,%%rsi\n");
     out(".Lsfmt64_dc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_dr\n");
     out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_dc\n");
-    out(".Lsfmt64_dr:\n    popq %%rbx\n    popq %%r14\n    popq %%r13\n    popq %%r12\n");
+    out(".Lsfmt64_dr:\n");
     out("    jmp .Lsfmt64_l\n");
     /* %s */
     out(".Lsfmt64_s:\n    incq %%r12\n");
     out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
-    out("    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n    pushq %%rbx\n");
     out("    movq (%%r14),%%rsi\n    addq $8,%%r14\n    decq %%r13\n");
     out(".Lsfmt64_sc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_sr\n");
     out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_sc\n");
-    out(".Lsfmt64_sr:\n    popq %%rbx\n    popq %%r14\n    popq %%r13\n    popq %%r12\n");
+    out(".Lsfmt64_sr:\n");
     out("    jmp .Lsfmt64_l\n");
     /* plain copy */
     out(".Lsfmt64_copy:\n    movb %%al,(%%rbx)\n    incq %%r12\n    incq %%rbx\n    jmp .Lsfmt64_l\n");
@@ -3208,11 +3398,31 @@ static void emit_data(void){
     if(ngvars>0){
         out(".section .data\n");
         for(int i=0;i<ngvars;i++){
+            /* On x86-64 every slot is 8 bytes, same as alloc_var's local-slot
+               convention — a plain `int` global can legally hold a heap
+               address from _flr_alloc (or any other 64-bit value that fits
+               through the same int/long widening), so it must not be
+               narrowed to 4 bytes just because it wasn't declared `long`.
+               On x86-32, int is already the native pointer width, so the
+               original int(4)/long+double(8) split still applies. */
             int sz=4;
-            if(gvars[i].type&&(gvars[i].type->kind==TY_LONG||gvars[i].type->kind==TY_DOUBLE))sz=8;
+            if(arch==ARCH_X86_64)sz=8;
+            else if(gvars[i].type&&(gvars[i].type->kind==TY_LONG||gvars[i].type->kind==TY_DOUBLE))sz=8;
             out(".globl _gv_%s\n_gv_%s:\n",gvars[i].name,gvars[i].name);
-            if(sz==8)out("    .quad %lld\n",(long long)gvars[i].ival);
-            else     out("    .long %d\n",(int)gvars[i].ival);
+            if(gvars[i].type&&gvars[i].type->kind==TY_DOUBLE){
+                /* always 8 bytes: raw IEEE-754 double bit pattern, same
+                   approach as the .Lfl%d float-literal constant pool above */
+                union{double d;unsigned u[2];}cv;cv.d=gvars[i].dval;
+                out("    .long %u\n    .long %u\n",cv.u[0],cv.u[1]);
+            } else if(gvars[i].type&&gvars[i].type->kind==TY_FLOAT){
+                union{float f;unsigned u;}cv;cv.f=(float)gvars[i].dval;
+                if(sz==8)out("    .long %u\n    .long 0\n",cv.u); /* pad to uniform 8-byte x86-64 slot; only the low 4 bytes are the float (matches how movss reads/writes local float slots) */
+                else     out("    .long %u\n",cv.u);
+            } else if(sz==8){
+                out("    .quad %lld\n",(long long)gvars[i].ival);
+            } else {
+                out("    .long %d\n",(int)gvars[i].ival);
+            }
         }
     }
 }
