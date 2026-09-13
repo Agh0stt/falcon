@@ -946,6 +946,34 @@ static StructInfo *find_struct(const char *name){
     return NULL;
 }
 
+/* Resolves the byte offset of `field_name` within the struct type of
+   `base` (using base->etype, already computed by typecheck() since
+   codegen runs on the same annotated tree). This MUST key off the
+   specific struct type, not just the field name — two different
+   structs are free to share a field name (e.g. both have a "kind" or
+   "sval" field) at different offsets, and a name-only search across
+   every registered struct would silently resolve to whichever struct
+   happened to be registered first, corrupting memory. */
+static int field_offset(Node *base,const char *field_name,int elem_size){
+    TypeRef *bt=base->etype;
+    if(bt&&bt->kind==TY_STRUCT&&bt->name){
+        StructInfo *si=find_struct(bt->name);
+        if(si){
+            for(int fi=0;fi<si->nfields;fi++)
+                if(strcmp(si->fields[fi].name,field_name)==0)return fi*elem_size;
+            die("%s:%d: struct '%s' has no field '%s'",base->file,base->line,bt->name,field_name);
+        }
+    }
+    /* fallback for raw pointer/int-typed bases where etype couldn't be
+       resolved to a specific struct: preserve old best-effort behaviour
+       rather than hard-failing. */
+    for(int si=0;si<nstructs;si++)
+        for(int fi=0;fi<structs[si].nfields;fi++)
+            if(strcmp(structs[si].fields[fi].name,field_name)==0)return fi*elem_size;
+    die("%s:%d: unknown field '%s'",base->file,base->line,field_name);
+    return -1;
+}
+
 /* ── typedef registry ───────────────────────────────────────────────── */
 typedef struct{char *alias;TypeRef *type;}TypeAlias;
 static TypeAlias typedefs[1024];
@@ -1944,11 +1972,7 @@ static void gen_expr(Node *n){
         out("    movl (%%eax),%%eax\n");break;
     case N_FIELD:{
         gen_expr(n->left);
-        int found_off=-1;
-        for(int si=0;si<nstructs&&found_off<0;si++)
-            for(int fi=0;fi<structs[si].nfields;fi++)
-                if(strcmp(structs[si].fields[fi].name,n->sval)==0){found_off=fi*4;break;}
-        if(found_off<0)die("%s:%d: unknown field '%s'",n->file,n->line,n->sval);
+        int found_off=field_offset(n->left,n->sval,4);
         out("    movl %d(%%eax),%%eax\n",found_off);break;
     }
     case N_ARRAYLIT:{
@@ -2008,11 +2032,7 @@ static void gen_store(Node *lv){
         out("    popl %%eax\n    movl %%eax,(%%edx)\n");break;
     case N_FIELD:{
         out("    pushl %%eax\n");gen_expr(lv->left);
-        int found_off=-1;
-        for(int si=0;si<nstructs&&found_off<0;si++)
-            for(int fi=0;fi<structs[si].nfields;fi++)
-                if(strcmp(structs[si].fields[fi].name,lv->sval)==0){found_off=fi*4;break;}
-        if(found_off<0)die("unknown field '%s'",lv->sval);
+        int found_off=field_offset(lv->left,lv->sval,4);
         out("    popl %%ecx\n    movl %%ecx,%d(%%eax)\n",found_off);break;
     }
     default:die("gen_store: not an lvalue");
@@ -2210,7 +2230,39 @@ static void emit_runtime(void){
     if(!freestanding){
         out(".globl _start\n_start:\n");
         out("    xorl %%ebp,%%ebp\n");
-        out("    call main\n");
+        if(has_std){
+            /* _flr_alloc only exists when the virtual std runtime is
+               emitted below (has_std). Build a Falcon-shaped argv array
+               (8-byte header + 4-byte elements) from the kernel's raw
+               argc/argv and pass it to main. Without has_std there is no
+               allocator available yet, so fall back to the plain call. */
+            out("    movl (%%esp),%%esi\n");        /* esi = argc */
+            out("    leal 4(%%esp),%%edi\n");        /* edi = &argv[0] */
+            out("    movl %%esi,%%eax\n");
+            out("    imull $4,%%eax,%%eax\n");
+            out("    addl $8,%%eax\n");
+            out("    pushl %%eax\n");
+            out("    call _flr_alloc\n");
+            out("    addl $4,%%esp\n");
+            out("    movl %%eax,%%ebx\n");           /* ebx = argv array ptr */
+            out("    movl %%esi,(%%ebx)\n");
+            out("    movl %%esi,4(%%ebx)\n");
+            out("    xorl %%ecx,%%ecx\n");
+            out(".Lflr_argv_copy:\n");
+            out("    cmpl %%esi,%%ecx\n");
+            out("    jge .Lflr_argv_done\n");
+            out("    movl (%%edi,%%ecx,4),%%edx\n");
+            out("    movl %%edx,8(%%ebx,%%ecx,4)\n");
+            out("    incl %%ecx\n");
+            out("    jmp .Lflr_argv_copy\n");
+            out(".Lflr_argv_done:\n");
+            out("    pushl %%ebx\n");
+            out("    pushl %%esi\n");
+            out("    call main\n");
+            out("    addl $8,%%esp\n");
+        } else {
+            out("    call main\n");
+        }
         out("    movl %%eax,%%ebx\n");
         out("    movl $1,%%eax\n");
         out("    int $0x80\n\n");
@@ -2538,11 +2590,7 @@ static void gen_store64(Node *lv){
         break;
     case N_FIELD:{
         out("    pushq %%rax\n"); gen_expr64(lv->left);
-        int found_off=-1;
-        for(int si=0;si<nstructs&&found_off<0;si++)
-            for(int fi=0;fi<structs[si].nfields;fi++)
-                if(strcmp(structs[si].fields[fi].name,lv->sval)==0){found_off=fi*8;break;}
-        if(found_off<0)die("unknown field '%s'",lv->sval);
+        int found_off=field_offset(lv->left,lv->sval,8);
         out("    popq %%rcx\n    movq %%rcx,%d(%%rax)\n",found_off);
         break;
     }
@@ -2873,11 +2921,7 @@ static void gen_expr64(Node *n){
         out("    movq (%%rax),%%rax\n"); break;
     case N_FIELD:{
         gen_expr64(n->left);
-        int found_off=-1;
-        for(int si=0;si<nstructs&&found_off<0;si++)
-            for(int fi=0;fi<structs[si].nfields;fi++)
-                if(strcmp(structs[si].fields[fi].name,n->sval)==0){found_off=fi*8;break;}
-        if(found_off<0)die("%s:%d: unknown field '%s'",n->file,n->line,n->sval);
+        int found_off=field_offset(n->left,n->sval,8);
         out("    movq %d(%%rax),%%rax\n",found_off); break;
     }
     case N_ARRAYLIT:{
@@ -3106,7 +3150,37 @@ static void emit_runtime64(void){
     if(!freestanding){
         out(".globl _start\n_start:\n");
         out("    xorl %%ebp,%%ebp\n");
-        out("    call main\n");
+        if(has_std){
+            /* Build a Falcon-shaped argv array (16-byte header + 8-byte
+               elements) from the kernel's raw argc/argv, System V AMD64
+               entry layout: [rsp]=argc, [rsp+8..]=argv[0..]. Keep values
+               in callee-saved regs (r12/r13/r14) so they survive the
+               call to _flr_alloc (which clobbers caller-saved regs). */
+            out("    movq (%%rsp),%%r12\n");        /* r12 = argc */
+            out("    leaq 8(%%rsp),%%r13\n");        /* r13 = &argv[0] */
+            out("    movq %%r12,%%rax\n");
+            out("    imulq $8,%%rax,%%rax\n");
+            out("    addq $16,%%rax\n");
+            out("    movq %%rax,%%rdi\n");
+            out("    call _flr_alloc\n");
+            out("    movq %%rax,%%r14\n");           /* r14 = argv array ptr */
+            out("    movq %%r12,(%%r14)\n");
+            out("    movq %%r12,8(%%r14)\n");
+            out("    xorq %%rcx,%%rcx\n");
+            out(".Lflr_argv_copy64:\n");
+            out("    cmpq %%r12,%%rcx\n");
+            out("    jge .Lflr_argv_done64\n");
+            out("    movq (%%r13,%%rcx,8),%%rdx\n");
+            out("    movq %%rdx,16(%%r14,%%rcx,8)\n");
+            out("    incq %%rcx\n");
+            out("    jmp .Lflr_argv_copy64\n");
+            out(".Lflr_argv_done64:\n");
+            out("    movq %%r12,%%rdi\n");           /* argc -> 1st arg */
+            out("    movq %%r14,%%rsi\n");           /* argv -> 2nd arg */
+            out("    call main\n");
+        } else {
+            out("    call main\n");
+        }
         out("    movl %%eax,%%edi\n");
         out("    movl $60,%%eax\n");
         out("    syscall\n\n");
