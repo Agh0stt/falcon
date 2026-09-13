@@ -31,7 +31,12 @@
 .globl _start
 _start:
     xorl  %ebp, %ebp            # mark outermost frame (ABI convention)
+    movl  (%esp), %eax          # argc is at top of stack
+    leal  4(%esp), %ecx         # argv = esp+4 (pointer to argv[0])
+    pushl %ecx                  # push argv (cdecl arg2)
+    pushl %eax                  # push argc (cdecl arg1)
     call  main
+    addl  $8, %esp
     movl  %eax, %ebx            # exit code = return value of main
     movl  $1,   %eax            # sys_exit
     int   $0x80
