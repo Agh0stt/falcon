@@ -1,0 +1,16 @@
+import "std"
+
+# A static local keeps its value across calls, unlike an ordinary
+# local (which is a fresh stack slot every call). It's backed by a
+# hidden, file-local global instead of the stack.
+func counter() -> int {
+    static n: int = 0
+    n += 1
+    return n
+}
+
+func main() -> void {
+    print(counter())
+    print(counter())
+    print(counter())
+}

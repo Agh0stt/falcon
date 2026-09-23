@@ -6,6 +6,11 @@ Falcon is a small compiled language targeting x86 Linux. It has a C-like feel bu
 
 ## What's new
 
+### v6
+- **`static`** — file-local linkage for top-level functions and globals. A `static func` or `static x: type` is emitted with `.local` instead of `.globl`, so it isn't visible to other object files linked into the same program.
+- **`static` locals** — `static n: int = 0` inside a function body keeps its value across calls, backed by a hidden file-local global instead of the stack. The initializer must be a compile-time literal (same rule as top-level globals); anything else starts at 0.
+- **`extern`** — forward-declares a function or global that's defined in another object file. `extern func foo(...) -> T` takes no body; `extern x: type` takes no initializer. Both just register a signature/symbol for the type checker and linker to resolve at link time.
+
 ### v5
 - **`typedef`** — C-style type aliases with full support for three forms:
   - `typedef int myint` — primitive or any type alias
@@ -241,6 +246,68 @@ func main() -> void {
 ```
 
 Struct variables hold a pointer. You must allocate memory before writing to any field (`nfields × 4` bytes).
+
+### Linkage: `static` and `extern`
+
+By default, every top-level function and global variable is exported (`.globl`) so other object files linked into the same program can see it.
+
+```falcon
+# file-local — not visible outside this object file
+static hit_count: int = 0
+
+static func track(label: str) -> void {
+    hit_count += 1
+    print(label)
+}
+```
+
+`extern` declares a function or global that's *defined elsewhere* and lets you use it without redefining it. An `extern func` has no body; an `extern` variable has no initializer:
+
+```falcon
+# lib.fl
+sq_cache: int = 0
+func square(n: int) -> int {
+    sq_cache = n * n
+    return sq_cache
+}
+
+# main.fl
+extern sq_cache: int
+extern func square(n: int) -> int
+
+func main() -> void {
+    print(square(6))   # 36
+    print(sq_cache)    # 36
+}
+```
+
+```bash
+./falconc lib.fl -o lib.s   && as --32 lib.s -o lib.o
+./falconc main.fl -o main.s && as --32 main.s -o main.o
+ld -m elf_i386 flr.o lib.o main.o -o prog
+```
+
+`static` and `extern` are mutually exclusive and only apply at the top level (functions and global variables) — they aren't valid on locals, `let`, or `const`.
+
+### Static locals
+
+A `static` variable declared inside a function keeps its value between calls, instead of getting a fresh stack slot every time:
+
+```falcon
+func counter() -> int {
+    static n: int = 0
+    n += 1
+    return n
+}
+
+func main() -> void {
+    print(counter())   # 1
+    print(counter())   # 2
+    print(counter())   # 3
+}
+```
+
+It's implemented as a hidden, uniquely-named file-local global (`.local` linkage) rather than a stack slot, so two functions can each declare `static n: int` with no collision. As with top-level globals, the initializer must be a compile-time literal — anything else emits a warning and the variable starts at 0.
 
 ### Typedef
 
@@ -500,6 +567,8 @@ The `examples/` folder has one file per language feature, numbered in order.
 | `25_assert.fl` | Assertions |
 | `26_comments.fl` | Comment syntax |
 | `27_typedef.fl` | Type aliases (`typedef`) |
+| `28_static_extern.fl` | File-local linkage with `static` (see README for a two-file `extern` example) |
+| `29_static_local.fl` | Function-local `static` variable persisting across calls |
 
 Run all of them at once:
 

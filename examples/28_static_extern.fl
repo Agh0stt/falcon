@@ -1,0 +1,16 @@
+import "std"
+
+# File-local: not exported with .globl, invisible to other object files
+# linked into the same program (emitted with .local instead).
+static hit_count: int = 0
+
+static func track(label: str) -> void {
+    hit_count += 1
+    print(label)
+}
+
+func main() -> void {
+    track("first")
+    track("second")
+    print(hit_count)
+}

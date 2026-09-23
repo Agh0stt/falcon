@@ -147,7 +147,8 @@ typedef enum{
     TT_PLUS,TT_MINUS,TT_STAR,TT_SLASH,TT_MOD,
     TT_AMPERSAND,TT_PIPE,TT_CARET,TT_TILDE,
     TT_SHL,TT_SHR,
-    TT_IDENT,TT_NEWLINE,TT_EOF
+    TT_IDENT,TT_NEWLINE,TT_EOF,
+    TT_STATIC,TT_EXTERN
 }TT;
 
 typedef struct{TT type;char *val;int line;const char *file;}Token;
@@ -168,6 +169,7 @@ static const KW kws[]={
     {"true",TT_TRUE},{"false",TT_FALSE},
     {"break",TT_BREAK},{"continue",TT_CONTINUE},
     {"struct",TT_STRUCT},{"import",TT_IMPORT},{"typedef",TT_TYPEDEF},
+    {"static",TT_STATIC},{"extern",TT_EXTERN},
     {NULL,0}
 };
 
@@ -500,6 +502,8 @@ struct Node{
     TypeRef *etype;         /* computed expression type (filled by type-checker) */
     long long ival;double dval;char *sval;int bval;char *op;
     int is_const;  /* for N_CONSTDECL: enforce immutability */
+    int is_static; /* N_FUNC/N_VARDECL(global): file-local linkage (.local, not .globl) */
+    int is_extern; /* N_FUNC/N_VARDECL(global): declared here, defined in another object file */
     Node *left,*right,*cond;
     char *fname;PList params;TypeRef *rettype;NList body;
     char *structname;FList fields;
@@ -738,6 +742,19 @@ static Node *parse_stmt(void){
         if(match(TT_ASSIGN)){skip_nl();n->left=parse_expr();}
         return n;
     }
+    /* static x: type [= expr]  (function-local, persistent storage — a
+       hidden global under the hood, initialized once at load time; the
+       initializer must be a compile-time literal, same restriction as
+       top-level globals). */
+    if(t->type==TT_STATIC){
+        advance();skip_nl();
+        Token *nm=expect(TT_IDENT,"variable name");skip_nl();expect(TT_COLON,":");skip_nl();
+        Node *n=mknode(N_VARDECL,nm->line);n->name=xstrdup(nm->val);
+        n->typeref=parse_type();skip_nl();
+        if(match(TT_ASSIGN)){skip_nl();n->left=parse_expr();}
+        n->is_static=1;
+        return n;
+    }
     /* const NAME: type = expr  (immutable compile-time constant) */
     if(t->type==TT_CONST){
         advance();skip_nl();
@@ -774,8 +791,9 @@ static NList parse_block(void){
     return list;
 }
 
-static Node *parse_func(void){
+static Node *parse_func(int is_static,int is_extern){
     Token *ft=expect(TT_FUNC,"func");Node *n=mknode(N_FUNC,ft->line);
+    n->is_static=is_static;n->is_extern=is_extern;
     skip_nl();Token *nm=expect(TT_IDENT,"function name");n->fname=xstrdup(nm->val);
     skip_nl();expect(TT_LPAREN,"(");skip_nl();
     if(!check(TT_RPAREN)){
@@ -788,6 +806,12 @@ static Node *parse_func(void){
     skip_nl();expect(TT_RPAREN,")");skip_nl();
     n->rettype=mktype(TY_VOID,NULL,NULL);
     if(match(TT_ARROW)){skip_nl();n->rettype=parse_type();skip_nl();}
+    if(is_extern){
+        /* extern func: signature only, defined in another object file.
+           No body — just a declaration, terminated like any other statement. */
+        if(check(TT_LBRACE))die("%s:%d: extern function '%s' cannot have a body",n->file,n->line,n->fname);
+        return n;
+    }
     expect(TT_LBRACE,"{");n->body=parse_block();expect(TT_RBRACE,"}");return n;
 }
 
@@ -887,7 +911,26 @@ static Node *parse_program(void){
     Node *prog=mknode(N_PROGRAM,1);
     for(;;){
         skip_nl();TT t=peek()->type;if(t==TT_EOF)break;
-        if(t==TT_FUNC)          nl_push(&prog->body,parse_func());
+        /* optional 'static' / 'extern' modifier ahead of func or a global var.
+           At most one of the two may be given; order is fixed (modifier first). */
+        int mod_static=0,mod_extern=0;
+        if(t==TT_STATIC){advance();skip_nl();mod_static=1;t=peek()->type;}
+        else if(t==TT_EXTERN){advance();skip_nl();mod_extern=1;t=peek()->type;}
+        if(t==TT_FUNC)          nl_push(&prog->body,parse_func(mod_static,mod_extern));
+        else if(mod_static||mod_extern){
+            /* only a global var declaration may follow a modifier now */
+            if(t!=TT_IDENT)die("%s:%d: expected function or variable declaration after '%s'",
+                peek()->file,peek()->line,mod_static?"static":"extern");
+            Token *nm=expect(TT_IDENT,"variable name");skip_nl();expect(TT_COLON,":");skip_nl();
+            Node *n=mknode(N_VARDECL,nm->line);n->name=xstrdup(nm->val);
+            n->typeref=parse_type();skip_nl();
+            if(mod_extern&&check(TT_ASSIGN))
+                die("%s:%d: extern variable '%s' cannot have an initializer",n->file,n->line,n->name);
+            if(match(TT_ASSIGN)){skip_nl();n->left=parse_expr();}
+            n->is_const=2; /* sentinel: global */
+            n->is_static=mod_static;n->is_extern=mod_extern;
+            nl_push(&prog->body,n);
+        }
         else if(t==TT_STRUCT)   nl_push(&prog->body,parse_struct());
         else if(t==TT_TYPEDEF)  nl_push(&prog->body,parse_typedef());
         else if(t==TT_IMPORT){
@@ -1022,9 +1065,11 @@ static TypeRef *find_tvar(const char *name){
 }
 
 /* ── global variables (declared here so typecheck can register them) ── */
-typedef struct{char *name;TypeRef *type;long long ival;double dval;int has_init;}GVar;
+typedef struct{char *name;TypeRef *type;long long ival;double dval;int has_init;int is_static;int is_extern;}GVar;
 static GVar gvars[4096];
 static int  ngvars=0;
+static int  nslocals=0;         /* counter for unique static-local symbol names */
+static const char *cur_fn_name=NULL; /* function currently being type-checked, for static-local mangling */
 static void push_tvar(const char *name,TypeRef *t){
     if(ntvars>=4096)die("too many variables");
     tvars[ntvars].name=xstrdup(name);tvars[ntvars].type=t;tvars[ntvars].is_const=0;ntvars++;
@@ -1287,7 +1332,36 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
                 die("%s:%d: cannot assign %s to variable '%s' of type %s",
                     n->file,n->line,type_name(et),n->name,type_name(decl));
         }
-        push_tvar(n->name,decl?decl:(n->left?n->left->etype:mktype(TY_INT,NULL,NULL)));
+        TypeRef *vt=decl?decl:(n->left?n->left->etype:mktype(TY_INT,NULL,NULL));
+        if(n->is_static){
+            /* function-local static: give it a unique hidden-global symbol
+               name and register it in gvars for codegen, same as a
+               top-level global. n->sval carries the mangled symbol name
+               through to statement codegen. */
+            char mangled[256];
+            snprintf(mangled,sizeof mangled,"_slocal_%s_%s_%d",cur_fn_name?cur_fn_name:"fn",n->name,nslocals++);
+            n->sval=xstrdup(mangled);
+            if(ngvars<4096){
+                gvars[ngvars].name=xstrdup(mangled);
+                gvars[ngvars].type=vt;
+                gvars[ngvars].has_init=(n->left!=NULL);
+                gvars[ngvars].is_static=1;   /* always file-local — never exported */
+                gvars[ngvars].is_extern=0;
+                long long iv=0;double dv=0.0;
+                if(n->left&&(n->left->kind==N_INTLIT||n->left->kind==N_LONGLIT||n->left->kind==N_BOOLLIT))
+                    iv=n->left->ival;
+                else if(n->left&&(n->left->kind==N_FLOATLIT||n->left->kind==N_DOUBLELIT))
+                    dv=n->left->dval;
+                else if(n->left)
+                    warn("%s:%d: static local '%s' initializer is not a compile-time literal; it will start at 0",
+                        n->file,n->line,n->name);
+                gvars[ngvars].ival=iv;
+                gvars[ngvars].dval=dv;
+                n->ival=ngvars; /* stash gvars index for statement codegen */
+                ngvars++;
+            }
+        }
+        push_tvar(n->name,vt);
         break;
     }
     case N_CONSTDECL:{
@@ -1402,6 +1476,8 @@ static void typecheck(Node *prog){
                 gvars[ngvars].name=xstrdup(n->name);
                 gvars[ngvars].type=vt;
                 gvars[ngvars].has_init=(n->left!=NULL);
+                gvars[ngvars].is_static=n->is_static;
+                gvars[ngvars].is_extern=n->is_extern;
                 /* extract literal value if it's a simple int/bool/long/float/
                    double literal (only compile-time-constant initializers are
                    supported; anything else stays zero and must be assigned
@@ -1425,7 +1501,9 @@ static void typecheck(Node *prog){
         /* push params into scope */
         for(int j=0;j<n->params.n;j++)
             push_tvar(n->params.d[j].name,n->params.d[j].type);
+        cur_fn_name=n->fname;
         tc_stmts(&n->body,n->rettype,0);
+        cur_fn_name=NULL;
         ntvars=saved_ntvars;/* pop function scope */
     }
 }
@@ -2046,6 +2124,18 @@ static void gen_stmt(Node *n){
     case N_VARDECL:
     case N_LETDECL:
     case N_CONSTDECL:{
+        if(n->is_static){
+            /* function-local static: backed by the hidden global slot
+               registered during type-check (n->sval / n->ival index).
+               No init code — a literal initializer is already baked
+               into .data by emit_data; anything else starts at 0. */
+            if(nvars>=4096)die("too many variables");
+            vars[nvars].name=xstrdup(n->name);
+            vars[nvars].offset=-999999-(int)n->ival;
+            vars[nvars].type=n->typeref?n->typeref:(n->left&&n->left->etype?n->left->etype:mktype(TY_INT,NULL,NULL));
+            nvars++;
+            break;
+        }
         TypeRef *vtype=n->typeref;
         /* infer type from initializer if not declared */
         if(!vtype&&n->left&&n->left->etype)vtype=n->left->etype;
@@ -2194,7 +2284,7 @@ static void gen_func(Node *fn){
     out_len=body_start;out_buf[out_len]=0;
 
     int fsz=(frame_sz+15)&~15;
-    out(".globl %s\n%s:\n",fn->fname,fn->fname);
+    out("%s %s\n%s:\n",fn->is_static?".local":".globl",fn->fname,fn->fname);
     out("    pushl %%ebp\n    movl %%esp,%%ebp\n");
     if(fsz>0)out("    subl $%d,%%esp\n",fsz);
     out("    pushl %%esi\n    pushl %%edi\n    pushl %%ebx\n");
@@ -2949,6 +3039,18 @@ static void gen_stmt64(Node *n){
     case N_VARDECL:
     case N_LETDECL:
     case N_CONSTDECL:{
+        if(n->is_static){
+            /* function-local static: backed by the hidden global slot
+               registered during type-check (n->sval / n->ival index).
+               No init code — a literal initializer is already baked
+               into .data by emit_data; anything else starts at 0. */
+            if(nvars>=4096)die("too many variables");
+            vars[nvars].name=xstrdup(n->name);
+            vars[nvars].offset=-999999-(int)n->ival;
+            vars[nvars].type=n->typeref?n->typeref:(n->left&&n->left->etype?n->left->etype:mktype(TY_INT,NULL,NULL));
+            nvars++;
+            break;
+        }
         TypeRef *vtype=n->typeref;
         if(!vtype&&n->left&&n->left->etype)vtype=n->left->etype;
         int off=alloc_var(n->name,vtype);
@@ -3117,7 +3219,7 @@ static void gen_func64(Node *fn){
 
     int fsz=(frame_sz+15)&~15;
 
-    out(".globl %s\n%s:\n",fn->fname,fn->fname);
+    out("%s %s\n%s:\n",fn->is_static?".local":".globl",fn->fname,fn->fname);
     out("    pushq %%rbp\n    movq %%rsp,%%rbp\n");
     if(fsz>0) out("    subq $%d,%%rsp\n",fsz);
     /* save callee-saved registers */
@@ -3470,8 +3572,16 @@ static void emit_data(void){
     out(".Lfl_zero:\n    .long 0\n    .long 0\n");
     /* emit global variables */
     if(ngvars>0){
-        out(".section .data\n");
+        int any_local=0;
+        for(int i=0;i<ngvars;i++)if(!gvars[i].is_extern){any_local=1;break;}
+        if(any_local)out(".section .data\n");
         for(int i=0;i<ngvars;i++){
+            if(gvars[i].is_extern){
+                /* declared here, defined in another object file: no storage,
+                   just tell the assembler the symbol is external. */
+                out(".extern _gv_%s\n",gvars[i].name);
+                continue;
+            }
             /* On x86-64 every slot is 8 bytes, same as alloc_var's local-slot
                convention — a plain `int` global can legally hold a heap
                address from _flr_alloc (or any other 64-bit value that fits
@@ -3482,7 +3592,7 @@ static void emit_data(void){
             int sz=4;
             if(arch==ARCH_X86_64)sz=8;
             else if(gvars[i].type&&(gvars[i].type->kind==TY_LONG||gvars[i].type->kind==TY_DOUBLE))sz=8;
-            out(".globl _gv_%s\n_gv_%s:\n",gvars[i].name,gvars[i].name);
+            out("%s _gv_%s\n_gv_%s:\n",gvars[i].is_static?".local":".globl",gvars[i].name,gvars[i].name);
             if(gvars[i].type&&gvars[i].type->kind==TY_DOUBLE){
                 /* always 8 bytes: raw IEEE-754 double bit pattern, same
                    approach as the .Lfl%d float-literal constant pool above */
@@ -3510,12 +3620,12 @@ static void codegen(Node *prog){
     out(".section .text\n\n");
     if(arch==ARCH_X86_64){
         for(int i=0;i<prog->body.n;i++){
-            Node *n=prog->body.d[i];if(n->kind==N_FUNC)gen_func64(n);
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern)gen_func64(n);
         }
         emit_runtime64();
     } else {
         for(int i=0;i<prog->body.n;i++){
-            Node *n=prog->body.d[i];if(n->kind==N_FUNC)gen_func(n);
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern)gen_func(n);
         }
         emit_runtime();
     }
