@@ -1,0 +1,3 @@
+# ERROR: function returns void
+import "std"
+func main() -> void { return 5 }

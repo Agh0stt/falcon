@@ -1,0 +1,4 @@
+# ERROR: expected bool, got str
+import "std"
+func f(a: bool) -> void { }
+func main() -> void { f("hi") }

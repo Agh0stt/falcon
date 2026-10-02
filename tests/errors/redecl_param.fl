@@ -1,0 +1,4 @@
+# ERROR: already declared
+import "std"
+func f(a: int, a: int) -> int { return a }
+func main() -> void { print(f(1, 2)) }

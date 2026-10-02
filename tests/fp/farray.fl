@@ -1,0 +1,9 @@
+# EXPECT: 1.500000|2.500000|4.000000
+import "std"
+func main() -> void {
+    a: [double] = [1.5, 2.5, 3.5]
+    print(a[0])
+    print(a[1])
+    a[2] = 4.0
+    print(a[2])
+}

@@ -1,0 +1,9 @@
+# EXPECT: -0.000000|-3.000000|3.000000
+import "std"
+func main() -> void {
+    z: double = 0.0
+    print(-z)
+    a: double = 3.0
+    print(-a)
+    print(-(-a))
+}

@@ -1,0 +1,5 @@
+# ERROR: already defined
+import "std"
+func f() -> void { }
+func f() -> void { }
+func main() -> void { f() }

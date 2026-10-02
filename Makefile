@@ -25,7 +25,7 @@ _OBJ   := $(_BASE).o
 _BIN   := $(_BASE)
 
 # ─────────────────────────────────────────────────────────────────────
-.PHONY: all run clean
+.PHONY: all run clean test
 
 all: falconc flr.o
 
@@ -54,7 +54,10 @@ freestanding: falconc $(F)
 	as --32 $(_ASM) -o $(_OBJ)
 	ld -m elf_i386 -T $(LDSCRIPT) $(_OBJ) -o $(_BASE).elf
 
+# ── tests: examples (exit status checked), tests/fp, tests/lang, tests/errors ──
+test: falconc flr.o
+	bash test.sh
+
 # ── clean ─────────────────────────────────────────────────────────────
 clean:
-	rm -f falconc flr.o *.s *.o *.elf
-	@# keep std.fl in place
+	rm -f falconc flr.o $(filter-out flr.s,$(wildcard *.s)) *.o *.elf

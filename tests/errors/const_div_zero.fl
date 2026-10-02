@@ -1,0 +1,4 @@
+# ERROR: not a compile-time constant
+import "std"
+const Z: int = 1 / 0
+func main() -> void { print(Z) }

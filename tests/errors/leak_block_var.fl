@@ -1,0 +1,4 @@
+# ERROR: undefined variable
+import "std"
+func main() -> void { if (true) { y: int = 1 }
+ print(y) }

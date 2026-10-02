@@ -1,0 +1,8 @@
+# EXPECT: 4294967297.500000|8589934592.000000
+import "std"
+func main() -> void {
+    l: long = 4294967296L
+    print(l + 1.5)
+    d: double = l
+    print(d * 2.0)
+}

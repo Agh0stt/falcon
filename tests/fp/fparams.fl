@@ -1,0 +1,14 @@
+# EXPECT: 3.750000|3.375000|3.500000|7.000000|2.500000
+import "std"
+func addf(a: float, b: float) -> float { return a + b }
+func muld(a: double, b: double) -> double { return a * b }
+func mixed(a: int, b: double) -> double { return a + b }
+func three(a: double, b: int, c: float) -> double { return a + b + c }
+func half(x: double) -> double { return x / 2.0 }
+func main() -> void {
+    print(addf(1.5f, 2.25f))
+    print(muld(1.5, 2.25))
+    print(mixed(3, 0.5))
+    print(three(1.0, 2, 4.0f))
+    print(half(5.0))
+}

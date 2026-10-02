@@ -1,0 +1,24 @@
+# EXPECT: 3|1.500000|7|2|1.500000|10|20
+import "std"
+func main() -> void {
+    x: double = 1.5
+    if (true) {
+        x: int = 3
+        print(x)
+    }
+    print(x)
+    for (i: int = 0, i < 1, i += 1) { print(7) }
+    for (i: int = 2, i < 3, i += 1) { print(i) }
+    k: int = 5
+    while (k > 4) {
+        k -= 1
+        k: int = 100
+    }
+    print(x)
+    a: int = 10
+    if (a == 10) {
+        b: int = 20
+        print(a)
+        print(b)
+    }
+}

@@ -1,0 +1,4 @@
+# ERROR: unterminated
+import "std"
+func main() -> void { }
+/* never closed

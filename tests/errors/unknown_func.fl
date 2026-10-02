@@ -1,0 +1,3 @@
+# ERROR: unknown function
+import "std"
+func main() -> void { nosuch(3) }

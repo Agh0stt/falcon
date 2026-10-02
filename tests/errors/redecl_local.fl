@@ -1,0 +1,5 @@
+# ERROR: already declared
+import "std"
+func main() -> void { x: int = 1
+ x: int = 2
+ print(x) }

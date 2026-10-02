@@ -1,0 +1,4 @@
+# ERROR: undefined variable
+import "std"
+func main() -> void { for (i: int = 0, i < 2, i += 1) { }
+ print(i) }

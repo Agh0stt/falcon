@@ -1,0 +1,12 @@
+# EXPECT: 1|1|1|0|1
+import "std"
+func main() -> void {
+    f: float = 1.5f
+    d: double = 1.5
+    i: int = 2
+    print(f == d)
+    print(i > f)
+    print(f < i)
+    print(d > 2)
+    print(d != 2.5)
+}

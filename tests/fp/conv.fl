@@ -1,0 +1,19 @@
+# EXPECT: 1.500000|3.140000|1.500000|7.000000|7.000000|2.000000
+import "std"
+func main() -> void {
+    f: float = 1.5f
+    x: double = f
+    print(x)
+    y: float = 3.14
+    print(y)
+    d: double = 1.5
+    z: float = d
+    print(z)
+    i: int = 7
+    a: double = i
+    print(a)
+    b: float = i
+    print(b)
+    c: double = 2
+    print(c)
+}

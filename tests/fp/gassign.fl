@@ -1,0 +1,10 @@
+# EXPECT: 6.000000|3.000000
+import "std"
+g: double = 1.0
+h: float = 1.0f
+func main() -> void {
+    g = 2.0 * 3
+    h = 3
+    print(g)
+    print(h)
+}

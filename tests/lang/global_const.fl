@@ -1,0 +1,36 @@
+# EXPECT: 10|21|3.500000|7.000000|5000000000|-4|19|1.000000|77|1|22|10.000000|21|30|11|2
+import "std"
+const A: int = 10
+const B: int = A * 2 + 1
+const PI: double = 3.5
+const TAU: double = PI * 2.0
+const BIG: long = 5000000000L
+const NEG = -4
+const MASK: int = (1 << 4) | 3
+const HALF: double = 1
+static const SC: int = 77
+const FLAG: bool = true
+g: int = B + 1
+h: double = A
+arr: [int] = [A, B]
+func area(r: int) -> int { return A * r }
+func main() -> void {
+    print(A)
+    print(B)
+    print(PI)
+    print(TAU)
+    print(BIG)
+    print(NEG)
+    print(MASK)
+    print(HALF)
+    print(SC)
+    print(FLAG)
+    print(g)
+    print(h)
+    print(arr[1])
+    print(area(3))
+    x: int = A + 1
+    print(x)
+    A: int = 2
+    print(A)
+}

@@ -1,0 +1,5 @@
+# ERROR: not a compile-time constant
+import "std"
+f: int = 3
+const A: int = f
+func main() -> void { print(A) }

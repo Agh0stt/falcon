@@ -1,0 +1,9 @@
+# EXPECT: 1.500000|2.500000|4.000000
+import "std"
+func main() -> void {
+    a: [float] = [1.5f, 2.5f, 3.5f]
+    print(a[0])
+    print(a[1])
+    a[2] = 4.0f
+    print(a[2])
+}

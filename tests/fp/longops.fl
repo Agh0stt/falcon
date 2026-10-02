@@ -1,0 +1,23 @@
+# EXPECT: 5|-3|12345678901|1|0|-3333333333|-1|4|7|-1|1|0|1
+import "std"
+func main() -> void {
+    a: long = 10000000000L
+    b: long = 2L
+    print(a / b / 1000000000L)
+    c: long = 0L - 3L
+    print(c)
+    print(a + 2345678901L)
+    print(a % 3L)
+    print(a < b)
+    d: long = 0L - a
+    print(d / 3L)
+    print(d % 3L)
+    x: long = 12L
+    print(x & 5L)
+    print(x ^ 11L)
+    print(~0L)
+    print(not 0L)
+    print(not a)
+    k: long = 4294967296L
+    print(k and 1L)
+}

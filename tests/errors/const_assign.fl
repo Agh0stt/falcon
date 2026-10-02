@@ -1,0 +1,4 @@
+# ERROR: cannot assign to const
+import "std"
+const A: int = 1
+func main() -> void { A = 5 }

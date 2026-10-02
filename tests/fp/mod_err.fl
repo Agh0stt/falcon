@@ -1,0 +1,5 @@
+# EXPECT: 1
+import "std"
+func main() -> void {
+    print(7 % 3)
+}

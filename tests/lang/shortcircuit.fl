@@ -1,0 +1,41 @@
+# EXPECT: 0|0|1|1|2|1|2|1|3|3|1|7|8|9
+import "std"
+calls: int = 0
+func side(v: int) -> int {
+    calls += 1
+    return v
+}
+func lside(v: long) -> long {
+    calls += 1
+    return v
+}
+func main() -> void {
+    r: int = 0 and side(1)
+    print(calls)
+    r = 1 or side(1)
+    print(calls)
+    r = 1 and side(0)
+    print(calls)
+    r = 0 or side(5)
+    print(r)
+    print(calls)
+    r = (1 and 1) and (0 or 2)
+    print(r)
+    z: long = 0L
+    r = z and lside(1L)
+    print(calls)
+    r = 4294967296L and lside(1L)
+    print(r)
+    r = 4294967296L or lside(1L)
+    print(calls)
+    d: double = 0.0
+    r = d and side(1)
+    print(calls)
+    r = (d or 1.5) and 1
+    print(r)
+    arr: [int] = [3]
+    i: int = 5
+    if (i < 1 and arr[i] == 0) { print(99) } else { print(7) }
+    if (i > 100 or i == 5) { print(8) }
+    if (not (i == 5) or i == 5) { print(9) }
+}

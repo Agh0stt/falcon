@@ -1,0 +1,4 @@
+# ERROR: extern const
+import "std"
+extern const Z: int
+func main() -> void { print(1) }

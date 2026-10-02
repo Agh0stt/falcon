@@ -1,0 +1,4 @@
+# ERROR: cannot assign double to global
+import "std"
+const A: int = 1.5
+func main() -> void { print(A) }

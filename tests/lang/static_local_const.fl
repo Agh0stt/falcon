@@ -1,0 +1,18 @@
+# EXPECT: 7|8|0
+import "std"
+const C: int = 5
+func f() -> int {
+    static n: int = C + 1
+    n += 1
+    return n
+}
+func shadowed() -> int {
+    C: int = 9
+    static m: int = C
+    return m
+}
+func main() -> void {
+    print(f())
+    print(f())
+    print(shadowed())
+}

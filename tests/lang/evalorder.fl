@@ -1,0 +1,50 @@
+# EXPECT: 12|-1|73|4|2|8.000000|111|1|3|93|abcd|3|2.500000|2134|0
+import "std"
+tr: int = 0
+func t(v: int) -> int {
+    tr = tr * 10 + v
+    return v
+}
+func tl(v: long) -> long {
+    tr = tr * 10 + v
+    return v
+}
+func td(v: double) -> double {
+    tr = tr * 10 + 1
+    return v
+}
+func main() -> void {
+    a: int = t(1) - t(2)
+    print(tr)
+    print(a)
+    tr = 0
+    b: long = tl(7L) - tl(3L)
+    print(tr)
+    print(b)
+    tr = 0
+    c: long = tl(5L) / t(2)
+    print(c)
+    tr = 0
+    d: double = td(10.0) - td(4.0) / td(2.0)
+    print(d)
+    print(tr)
+    tr = 0
+    e: bool = td(1.0) < td(2.0)
+    print(e)
+    tr = 0
+    f: int = t(9) / t(3)
+    print(f)
+    print(tr)
+    s: str = str_concat("ab", "cd")
+    print(s)
+    tr = 0
+    p: int = t(8) % t(5)
+    print(p)
+    q: float = 1.5
+    r: float = q * 2.0 + q / 3.0 - 1.0
+    print(r)
+    tr = 0
+    g: bool = t(2) > t(1) and t(3) > t(4)
+    print(tr)
+    print(g)
+}

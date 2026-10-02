@@ -1,0 +1,10 @@
+# Long arithmetic must link even when the virtual std runtime is not enabled.
+func main() -> void {
+    a: long = 4294967296L
+    b: long = 5L
+    result: long = a + b
+    if (result == 4294967301L) {
+        __syscall(1, 0)
+    }
+    __syscall(1, 1)
+}

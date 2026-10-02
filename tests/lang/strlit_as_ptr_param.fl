@@ -1,0 +1,6 @@
+# EXPECT: ok
+import "std"
+func plen(p: int) -> int { return _flr_str_len(p) }
+func main() -> void {
+    if (plen("abc") == 3) { print("ok") }
+}

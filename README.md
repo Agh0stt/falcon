@@ -6,6 +6,10 @@ Falcon is a small compiled language targeting x86 Linux. It has a C-like feel bu
 
 ## What's new
 
+### v6.1
+- **Top-level `const`** — `const A: int = 10`, `const B = A * 2 + 1`, `static const`. Immutable; initializer must be a compile-time constant (literals, operators, other consts).
+- Global initializers are type-checked (`g: int = 1.5` is now an error instead of silently truncating).
+
 ### v6
 - **`static`** — file-local linkage for top-level functions and globals. A `static func` or `static x: type` is emitted with `.local` instead of `.globl`, so it isn't visible to other object files linked into the same program.
 - **`static` locals** — `static n: int = 0` inside a function body keeps its value across calls, backed by a hidden file-local global instead of the stack. The initializer must be a compile-time literal (same rule as top-level globals); anything else starts at 0.
@@ -519,7 +523,7 @@ In freestanding mode `import "std"` and all `_flr_*` functions are unavailable. 
 ```bash
 # 32-bit hosted (the normal case)
 as --32 out.s -o out.o
-ld -m elf_i386 --allow-multiple-definition flr.o out.o -o prog
+ld -m elf_i386 flr.o out.o -o prog
 
 # 64-bit hosted
 as out.s -o out.o
@@ -582,7 +586,7 @@ Or manually:
 for f in examples/*.fl; do
     echo "=== $f ==="
     ./falconc "$f" -o /tmp/t.s && as --32 /tmp/t.s -o /tmp/t.o && \
-    ld -m elf_i386 --allow-multiple-definition flr.o /tmp/t.o -o /tmp/t && /tmp/t
+    ld -m elf_i386 flr.o /tmp/t.o -o /tmp/t && /tmp/t
 done
 ```
 

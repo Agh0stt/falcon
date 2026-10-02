@@ -1,0 +1,5 @@
+# ERROR: already defined
+import "std"
+g: int = 1
+g: int = 2
+func main() -> void { print(g) }

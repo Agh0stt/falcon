@@ -1,0 +1,12 @@
+# EXPECT: 100000.500000|100000.500000|2000000000.000000|-70000.500000
+import "std"
+func main() -> void {
+    i: int = 100000
+    d: double = 0.5
+    print(i + d)
+    print(d + i)
+    big: int = 2000000000
+    print(big + 0.0)
+    n: int = -70001
+    print(n + 0.5)
+}

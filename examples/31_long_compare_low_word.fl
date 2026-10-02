@@ -1,0 +1,13 @@
+# With equal high words, signed 64-bit ordering must compare low words unsigned.
+func main() -> void {
+    high_bit: long = 2147483648L
+    one: long = 1L
+    if (high_bit > one) {
+        if (one < high_bit) {
+            if (high_bit >= one) {
+                if (one <= high_bit) { __syscall(1, 0) }
+            }
+        }
+    }
+    __syscall(1, 1)
+}

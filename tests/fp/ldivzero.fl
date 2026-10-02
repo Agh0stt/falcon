@@ -1,0 +1,10 @@
+# EXPECT: before
+import "std"
+func main() -> int {
+    a: long = 10
+    z: long = 0
+    print("before")
+    r: long = a / z
+    print("after")
+    return 0
+}

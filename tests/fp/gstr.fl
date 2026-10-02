@@ -1,0 +1,13 @@
+# EXPECT: hello|3|2.500000|8
+import "std"
+msg: str = "hello"
+nums: [int] = [1, 2, 3]
+w: [double] = [0.5, 2.5]
+total: int = 3 + 5
+func get() -> int { return nums[2] }
+func main() -> void {
+    print(msg)
+    print(get())
+    print(w[1])
+    print(total)
+}

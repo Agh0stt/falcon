@@ -1,0 +1,10 @@
+# EXPECT: 1.000000|2.500000|3.000000
+import "std"
+func a() -> double { return 1 }
+func b() -> double { return 2.5f }
+func c() -> float { return 3.0 }
+func main() -> void {
+    print(a())
+    print(b())
+    print(c())
+}

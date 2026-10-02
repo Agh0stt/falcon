@@ -28,7 +28,7 @@
 # _start — ELF entry point
 #   Calls main(), then exits with its return value (0 for void main).
 # ─────────────────────────────────────────────────────────────────────
-.globl _start
+.weak _start
 _start:
     xorl  %ebp, %ebp            # mark outermost frame (ABI convention)
     movl  (%esp), %eax          # argc is at top of stack
@@ -44,7 +44,7 @@ _start:
 # ─────────────────────────────────────────────────────────────────────
 # memset(ptr, val, n)  — cdecl, clobbers eax/ecx/edi
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_memset
+.weak _flr_memset
 _flr_memset:
     pushl %ebp
     movl  %esp, %ebp
@@ -60,7 +60,7 @@ _flr_memset:
 # ─────────────────────────────────────────────────────────────────────
 # memcpy(dst, src, n)
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_memcpy
+.weak _flr_memcpy
 _flr_memcpy:
     pushl %ebp
     movl  %esp, %ebp
@@ -78,7 +78,7 @@ _flr_memcpy:
 # ─────────────────────────────────────────────────────────────────────
 # print_str(s)  — writes s + newline to stdout (fd 1)
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_print_str
+.weak _flr_print_str
 _flr_print_str:
     pushl %ebp
     movl  %esp, %ebp
@@ -110,7 +110,7 @@ _flr_print_str:
 # ─────────────────────────────────────────────────────────────────────
 # print_int(n)  — converts n, writes decimal + newline to stdout
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_print_int
+.weak _flr_print_int
 _flr_print_int:
     pushl %ebp
     movl  %esp, %ebp
@@ -156,7 +156,7 @@ _flr_print_int:
 # ─────────────────────────────────────────────────────────────────────
 # exit(code)
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_exit
+.weak _flr_exit
 _flr_exit:
     movl  4(%esp), %ebx
     movl  $1, %eax
@@ -165,7 +165,7 @@ _flr_exit:
 # ─────────────────────────────────────────────────────────────────────
 # strlen(s) / str_len(s)  -> int
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_strlen
+.weak _flr_strlen
 _flr_strlen:
     movl  4(%esp), %ecx
     movl  %ecx, %eax
@@ -179,14 +179,14 @@ _flr_strlen:
     movl  %ecx, %eax
     ret
 
-.globl _flr_str_len
+.weak _flr_str_len
 _flr_str_len:
     jmp   _flr_strlen
 
 # ─────────────────────────────────────────────────────────────────────
 # str_eq(a, b) -> int  (1 = equal, 0 = different)
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_str_eq
+.weak _flr_str_eq
 _flr_str_eq:
     pushl %ebp
     movl  %esp, %ebp
@@ -218,7 +218,7 @@ _flr_str_eq:
 # ─────────────────────────────────────────────────────────────────────
 # int_to_str(n) -> str  (pointer into static buffer — use before next call)
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_int_to_str
+.weak _flr_int_to_str
 _flr_int_to_str:
     pushl %ebp
     movl  %esp, %ebp
@@ -259,7 +259,7 @@ _flr_int_to_str:
 # ─────────────────────────────────────────────────────────────────────
 # str_to_int(s) -> int
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_str_to_int
+.weak _flr_str_to_int
 _flr_str_to_int:
     pushl %ebp
     movl  %esp, %ebp
@@ -294,7 +294,7 @@ _flr_str_to_int:
 # ─────────────────────────────────────────────────────────────────────
 # abs(n) -> int
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_abs
+.weak _flr_abs
 _flr_abs:
     movl  4(%esp), %eax
     testl %eax, %eax
@@ -306,7 +306,7 @@ _flr_abs:
 # ─────────────────────────────────────────────────────────────────────
 # min(a, b) -> int
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_min
+.weak _flr_min
 _flr_min:
     movl  4(%esp), %eax
     movl  8(%esp), %ecx
@@ -319,7 +319,7 @@ _flr_min:
 # ─────────────────────────────────────────────────────────────────────
 # max(a, b) -> int
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_max
+.weak _flr_max
 _flr_max:
     movl  4(%esp), %eax
     movl  8(%esp), %ecx
@@ -333,7 +333,7 @@ _flr_max:
 # assert(cond, msg)  — prints "assertion failed: <msg>\n" to stderr
 #                       then calls sys_exit(1) if cond == 0
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_assert
+.weak _flr_assert
 _flr_assert:
     pushl %ebp
     movl  %esp, %ebp
@@ -379,7 +379,7 @@ _flr_assert:
 # alloc(size) -> ptr   bump heap allocator over 1 MB BSS region
 # free(ptr)           no-op
 # ─────────────────────────────────────────────────────────────────────
-.globl _flr_alloc
+.weak _flr_alloc
 _flr_alloc:
     pushl %ebp
     movl  %esp, %ebp
@@ -391,7 +391,7 @@ _flr_alloc:
     leave
     ret
 
-.globl _flr_free
+.weak _flr_free
 _flr_free:
     ret
 

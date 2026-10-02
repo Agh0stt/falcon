@@ -1,0 +1,18 @@
+# EXPECT: 10|30|7|1.500000|3.500000|2.250000|9.000000|5
+import "std"
+ga: [int] = [10, 20, 30]
+gd: [double] = [1.5, 2.5, 3.5]
+gf: [float] = [2.25f, 4.5f]
+func main() -> void {
+    print(ga[0])
+    print(ga[2])
+    ga[1] = 7
+    print(ga[1])
+    print(gd[0])
+    print(gd[2])
+    print(gf[0])
+    gd[1] = 9.0
+    print(gd[1])
+    ga[0] = ga[1] - 2
+    print(ga[0])
+}

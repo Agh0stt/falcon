@@ -1,0 +1,22 @@
+# EXPECT: 1.500000|2.500000|7|3.000000|-4.250000
+import "std"
+struct P {
+    x: double
+    y: double
+    n: int
+    z: float
+    w: double
+}
+func main() -> void {
+    p: P = _flr_alloc(64)
+    p.x = 1.5
+    p.y = 2.5
+    p.n = 7
+    p.z = 3.0f
+    p.w = -4.25
+    print(p.x)
+    print(p.y)
+    print(p.n)
+    print(p.z)
+    print(p.w)
+}

@@ -88,7 +88,8 @@ static int has_std;
 static char *imported_files[MAX_IMPORTED];
 static int   nimported=0;
 static int already_imported(const char *p){
-    for(int i=0;i<nimported;i++)if(strcmp(imported_files[i],p)==0)return 1;return 0;
+    for(int i=0;i<nimported;i++)if(strcmp(imported_files[i],p)==0)return 1;
+    return 0;
 }
 static void mark_imported(const char *p){
     if(nimported<MAX_IMPORTED)imported_files[nimported++]=xstrdup(p);
@@ -188,9 +189,12 @@ static void tokenize(const char *src,const char *filename){
         if(c==' '||c=='\t'||c=='\r'){i++;continue;}
         if(c=='#'){while(i<n&&src[i]!='\n')i++;continue;}
         if(c=='/'&&i+1<n&&src[i+1]=='*'){
+            int cstart=line;
             i+=2;
             while(i+1<n&&!(src[i]=='*'&&src[i+1]=='/')){if(src[i]=='\n')line++;i++;}
-            if(i+1<n)i+=2;continue;
+            if(i+1>=n)die("%s:%d: unterminated /* comment",file,cstart);
+            i+=2;
+            continue;
         }
         if(c=='\n'){
             if(!last_nl)emit_tok(TT_NEWLINE,"\n",line,file);
@@ -238,22 +242,40 @@ static void tokenize(const char *src,const char *filename){
         if(isdigit(c)||(c=='.'&&i+1<n&&isdigit((unsigned char)src[i+1]))){
             int j=i;
             while(j<n&&isdigit((unsigned char)src[j]))j++;
-            int is_float=0,is_double=0;
-            if(j<n&&src[j]=='.'){
-                j++;
-                while(j<n&&isdigit((unsigned char)src[j]))j++;
-                /* exponent */
-                if(j<n&&(src[j]=='e'||src[j]=='E')){
+            int is_float=0;
+            /* a literal is floating-point if it has a '.', or an exponent
+               that is actually followed by digits (so `1e6` works but an
+               identifier like `1else` is not swallowed) */
+            int has_dot=(j<n&&src[j]=='.');
+            int has_exp=0;
+            if(!has_dot&&j<n&&(src[j]=='e'||src[j]=='E')){
+                int k=j+1;
+                if(k<n&&(src[k]=='+'||src[k]=='-'))k++;
+                if(k<n&&isdigit((unsigned char)src[k]))has_exp=1;
+            }
+            if(has_dot||has_exp){
+                if(has_dot){
                     j++;
-                    if(j<n&&(src[j]=='+'||src[j]=='-'))j++;
                     while(j<n&&isdigit((unsigned char)src[j]))j++;
                 }
+                /* exponent (only if followed by digits) */
+                if(j<n&&(src[j]=='e'||src[j]=='E')){
+                    int k=j+1;
+                    if(k<n&&(src[k]=='+'||src[k]=='-'))k++;
+                    if(k<n&&isdigit((unsigned char)src[k])){
+                        j=k;
+                        while(j<n&&isdigit((unsigned char)src[j]))j++;
+                    }
+                }
                 /* suffix: f/F = float, d/D or none = double */
-                if(j<n&&(src[j]=='f'||src[j]=='F')){is_float=1;}
-                else{is_double=1;}
+                int suffix=0;
+                if(j<n&&(src[j]=='f'||src[j]=='F')){is_float=1;suffix=1;}
+                else if(j<n&&(src[j]=='d'||src[j]=='D')){suffix=1;}
+                /* the suffix must end the token (don't eat the start of an identifier) */
+                if(suffix&&j+1<n&&(isalnum((unsigned char)src[j+1])||src[j+1]=='_')){suffix=0;is_float=0;}
                 char *s=xstrndup(src+i,j-i);
                 emit_tok(is_float?TT_FLOAT_LIT:TT_DOUBLE_LIT,s,line,file);
-                free(s);i=j+(is_float?1:0);continue;
+                free(s);i=j+suffix;continue;
             }
             int is_long=(j<n&&(src[j]=='L'||src[j]=='l'));
             char *s=xstrndup(src+i,j-i);
@@ -328,7 +350,9 @@ static void tokenize(const char *src,const char *filename){
 static char *read_file(const char *path){
     FILE *f=fopen(path,"rb");if(!f)return NULL;
     fseek(f,0,SEEK_END);long sz=ftell(f);rewind(f);
-    char *buf=malloc(sz+1);fread(buf,1,sz,f);buf[sz]=0;fclose(f);return buf;
+    char *buf=malloc(sz+1);
+    size_t got=fread(buf,1,sz,f);
+    buf[got]=0;fclose(f);return buf;
 }
 
 static void expand_imports(int start,const char *from_file);
@@ -504,6 +528,7 @@ struct Node{
     int is_const;  /* for N_CONSTDECL: enforce immutability */
     int is_static; /* N_FUNC/N_VARDECL(global): file-local linkage (.local, not .globl) */
     int is_extern; /* N_FUNC/N_VARDECL(global): declared here, defined in another object file */
+    int is_gconst; /* N_VARDECL(global): top-level `const` (immutable, compile-time constant initializer) */
     Node *left,*right,*cond;
     char *fname;PList params;TypeRef *rettype;NList body;
     char *structname;FList fields;
@@ -586,11 +611,19 @@ static Node *parse_primary(void){
     }
     if(t->type==TT_INT_LIT){
         advance();Node *n=mknode(N_INTLIT,t->line);
-        if(t->val[0]=='0'&&(t->val[1]=='x'||t->val[1]=='X'))
-            n->ival=(long long)strtoll(t->val,NULL,16);
-        else if(t->val[0]=='0'&&(t->val[1]=='b'||t->val[1]=='B'))
-            n->ival=(long long)strtoll(t->val+2,NULL,2);
-        else n->ival=atoll(t->val);
+        int is_dec=1;
+        if(t->val[0]=='0'&&(t->val[1]=='x'||t->val[1]=='X')){
+            n->ival=(long long)strtoull(t->val,NULL,16);is_dec=0;
+        }else if(t->val[0]=='0'&&(t->val[1]=='b'||t->val[1]=='B')){
+            n->ival=(long long)strtoull(t->val+2,NULL,2);is_dec=0;
+        }else n->ival=atoll(t->val);
+        /* A literal that does not fit in 32 bits is a long (like C). Without
+           this the 32-bit backend emitted `movl $4294967296,%eax`, which the
+           assembler silently truncated to 0 (the 64-bit backend was fine).
+           Hex/binary up to 0xFFFFFFFF stay int so 0x80000000-style constants
+           keep working. */
+        if((is_dec&&n->ival>2147483647LL)||(!is_dec&&(unsigned long long)n->ival>0xFFFFFFFFULL))
+            n->kind=N_LONGLIT;
         return n;
     }
     if(t->type==TT_STR_LIT){
@@ -916,7 +949,19 @@ static Node *parse_program(void){
         int mod_static=0,mod_extern=0;
         if(t==TT_STATIC){advance();skip_nl();mod_static=1;t=peek()->type;}
         else if(t==TT_EXTERN){advance();skip_nl();mod_extern=1;t=peek()->type;}
-        if(t==TT_FUNC)          nl_push(&prog->body,parse_func(mod_static,mod_extern));
+        if(t==TT_CONST&&mod_extern)
+            die("%s:%d: 'extern const' is not supported",peek()->file,peek()->line);
+        if(t==TT_CONST){
+            /* const NAME [: type] = constant-expression   (optionally `static const`) */
+            advance();skip_nl();
+            Token *nm=expect(TT_IDENT,"constant name");skip_nl();
+            Node *n=mknode(N_VARDECL,nm->line);n->name=xstrdup(nm->val);
+            if(match(TT_COLON)){skip_nl();n->typeref=parse_type();skip_nl();}
+            expect(TT_ASSIGN,"=");skip_nl();n->left=parse_expr();
+            n->is_const=2;n->is_gconst=1;n->is_static=mod_static;
+            nl_push(&prog->body,n);
+        }
+        else if(t==TT_FUNC)     nl_push(&prog->body,parse_func(mod_static,mod_extern));
         else if(mod_static||mod_extern){
             /* only a global var declaration may follow a modifier now */
             if(t!=TT_IDENT)die("%s:%d: expected function or variable declaration after '%s'",
@@ -997,22 +1042,39 @@ static StructInfo *find_struct(const char *name){
    "sval" field) at different offsets, and a name-only search across
    every registered struct would silently resolve to whichever struct
    happened to be registered first, corrupting memory. */
+/* Bytes one field occupies. elem_size==8 is the x86-64 target (every field is
+   a full 8-byte slot). On x86-32 fields are 4 bytes, except `long` and
+   `double`, which need 8 — with a flat fi*4 layout a double field overlapped
+   its neighbour and a long field lost its high word. */
+static int field_size(TypeRef *t,int elem_size){
+    if(elem_size==8)return 8;
+    return (t&&(t->kind==TY_LONG||t->kind==TY_DOUBLE))?8:4;
+}
+static int field_offset_in(StructInfo *si,const char *field_name,int elem_size){
+    int off=0;
+    for(int fi=0;fi<si->nfields;fi++){
+        if(strcmp(si->fields[fi].name,field_name)==0)return off;
+        off+=field_size(si->fields[fi].type,elem_size);
+    }
+    return -1;
+}
 static int field_offset(Node *base,const char *field_name,int elem_size){
     TypeRef *bt=base->etype;
     if(bt&&bt->kind==TY_STRUCT&&bt->name){
         StructInfo *si=find_struct(bt->name);
         if(si){
-            for(int fi=0;fi<si->nfields;fi++)
-                if(strcmp(si->fields[fi].name,field_name)==0)return fi*elem_size;
+            int o=field_offset_in(si,field_name,elem_size);
+            if(o>=0)return o;
             die("%s:%d: struct '%s' has no field '%s'",base->file,base->line,bt->name,field_name);
         }
     }
     /* fallback for raw pointer/int-typed bases where etype couldn't be
        resolved to a specific struct: preserve old best-effort behaviour
        rather than hard-failing. */
-    for(int si=0;si<nstructs;si++)
-        for(int fi=0;fi<structs[si].nfields;fi++)
-            if(strcmp(structs[si].fields[fi].name,field_name)==0)return fi*elem_size;
+    for(int si=0;si<nstructs;si++){
+        int o=field_offset_in(&structs[si],field_name,elem_size);
+        if(o>=0)return o;
+    }
     die("%s:%d: unknown field '%s'",base->file,base->line,field_name);
     return -1;
 }
@@ -1058,6 +1120,7 @@ static TypeRef *resolve_typedef(const char *name){
 typedef struct{char *name;TypeRef *type;int is_const;}TVar;
 static TVar  tvars[4096];
 static int   ntvars=0;
+static int   scope_base=0;   /* first tvars[] index belonging to the innermost scope */
 
 static TypeRef *find_tvar(const char *name){
     for(int i=ntvars-1;i>=0;i--)if(strcmp(tvars[i].name,name)==0)return tvars[i].type;
@@ -1070,6 +1133,8 @@ static GVar gvars[4096];
 static int  ngvars=0;
 static int  nslocals=0;         /* counter for unique static-local symbol names */
 static const char *cur_fn_name=NULL; /* function currently being type-checked, for static-local mangling */
+/* same name twice in one scope is an error (shadowing an outer scope is fine) */
+static void check_redecl(const char *name,Node *at);
 static void push_tvar(const char *name,TypeRef *t){
     if(ntvars>=4096)die("too many variables");
     tvars[ntvars].name=xstrdup(name);tvars[ntvars].type=t;tvars[ntvars].is_const=0;ntvars++;
@@ -1077,6 +1142,16 @@ static void push_tvar(const char *name,TypeRef *t){
 static void push_tvar_const(const char *name,TypeRef *t){
     if(ntvars>=4096)die("too many variables");
     tvars[ntvars].name=xstrdup(name);tvars[ntvars].type=t;tvars[ntvars].is_const=1;ntvars++;
+}
+static void check_redecl(const char *name,Node *at){
+    for(int i=scope_base;i<ntvars;i++)
+        if(strcmp(tvars[i].name,name)==0)
+            die("%s:%d: '%s' is already declared in this scope",at->file,at->line,name);
+}
+/* a string literal is a pointer, not a number: `x: int = "abc"` is a mistake */
+static void check_strlit_dest(Node *e,TypeRef *dest,const char *what,Node *at){
+    if(e&&e->kind==N_STRLIT&&dest&&(dest->kind==TY_INT||dest->kind==TY_BOOL))
+        die("%s:%d: cannot assign str to %s of type %s",at->file,at->line,what,type_name(dest));
 }
 
 static TypeRef *tc_expr(Node *n,TypeRef *expected_ret);
@@ -1149,8 +1224,64 @@ static TypeRef *builtin_rettype(const char *name){
     return NULL;
 }
 
+static int is_fp_type(TypeRef *t){return t&&(t->kind==TY_FLOAT||t->kind==TY_DOUBLE);}
+
+/* wrap a float/double expression as `(e != 0.0)` so it can be used as a
+   condition / logical operand (the integer code paths just test eax/rax,
+   which for a float is its bit pattern or — on x86-64 — a stale register) */
+static Node *fp_to_bool(Node *e){
+    if(!e||!is_fp_type(e->etype))return e;
+    Node *z=calloc(1,sizeof*z);z->kind=N_DOUBLELIT;z->line=e->line;z->file=e->file;
+    z->dval=0.0;z->etype=mktype(TY_DOUBLE,NULL,NULL);
+    Node *b=calloc(1,sizeof*b);b->kind=N_BINOP;b->line=e->line;b->file=e->file;
+    b->op=xstrdup("!=");b->left=e;b->right=z;b->etype=mktype(TY_BOOL,NULL,NULL);
+    return b;
+}
+
+/* result type + operand validation for every binary operator once both
+   operand types are known. Shared by N_BINOP and desugared `x op= y`. */
+static void tc_binop_finish(Node *n,TypeRef *lt,TypeRef *rt){
+    const char *op=n->op;
+    int cmp=(strcmp(op,"==")==0||strcmp(op,"!=")==0||strcmp(op,"<")==0||
+             strcmp(op,">")==0||strcmp(op,"<=")==0||strcmp(op,">=")==0);
+    if(cmp){
+        /* numeric widening is fine in either direction (`i > f`, `f < i`) */
+        if(!types_compat(lt,rt)&&!types_compat(rt,lt))
+            die("%s:%d: cannot compare %s with %s",n->file,n->line,type_name(lt),type_name(rt));
+        n->etype=mktype(TY_BOOL,NULL,NULL);
+    }else if(strcmp(op,"and")==0||strcmp(op,"or")==0){
+        n->left=fp_to_bool(n->left);n->right=fp_to_bool(n->right);
+        n->etype=mktype(TY_BOOL,NULL,NULL);
+    }else if(strcmp(op,"+")==0&&(lt->kind==TY_STR||rt->kind==TY_STR)){
+        /* str + str only allowed if both are str; otherwise error */
+        if(lt->kind!=TY_STR||rt->kind!=TY_STR)
+            die("%s:%d: cannot add str and %s — use str_concat()",n->file,n->line,
+                lt->kind!=TY_STR?type_name(lt):type_name(rt));
+        n->etype=mktype(TY_STR,NULL,NULL);
+    }else{
+        if(!type_is_numeric(lt))
+            die("%s:%d: operator '%s' requires numeric left operand, got %s",
+                n->file,n->line,op,type_name(lt));
+        if(!type_is_numeric(rt))
+            die("%s:%d: operator '%s' requires numeric right operand, got %s",
+                n->file,n->line,op,type_name(rt));
+        int fp=is_fp_type(lt)||is_fp_type(rt);
+        if(fp&&(strcmp(op,"+")!=0&&strcmp(op,"-")!=0&&strcmp(op,"*")!=0&&strcmp(op,"/")!=0&&strcmp(op,"%")!=0))
+            die("%s:%d: operator '%s' is not defined for float/double operands",n->file,n->line,op);
+        /* double > float > long > int  (a long mixed with a double is a double) */
+        if(lt->kind==TY_DOUBLE||rt->kind==TY_DOUBLE)
+            n->etype=mktype(TY_DOUBLE,NULL,NULL);
+        else if(lt->kind==TY_FLOAT||rt->kind==TY_FLOAT)
+            n->etype=mktype(TY_FLOAT,NULL,NULL);
+        else if(lt->kind==TY_LONG||rt->kind==TY_LONG)
+            n->etype=mktype(TY_LONG,NULL,NULL);
+        else
+            n->etype=mktype(TY_INT,NULL,NULL);
+    }
+}
+
 static TypeRef *tc_expr(Node *n,TypeRef *ret){
-    if(!n){n->etype=mktype(TY_VOID,NULL,NULL);return n->etype;}
+    if(!n)return mktype(TY_VOID,NULL,NULL);
     switch(n->kind){
     case N_INTLIT:  n->etype=mktype(TY_INT,NULL,NULL); break;
     case N_LONGLIT: n->etype=mktype(TY_LONG,NULL,NULL);break;
@@ -1166,10 +1297,18 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
     case N_UNOP:{
         TypeRef *et=tc_expr(n->left,ret);
         if(strcmp(n->op,"not")==0){
+            if(is_fp_type(et)){
+                /* not x  ==>  x == 0.0 */
+                Node *z=calloc(1,sizeof*z);z->kind=N_DOUBLELIT;z->line=n->line;z->file=n->file;
+                z->dval=0.0;z->etype=mktype(TY_DOUBLE,NULL,NULL);
+                n->kind=N_BINOP;n->op=xstrdup("==");n->right=z;
+            }
             n->etype=mktype(TY_BOOL,NULL,NULL);
         }else if(strcmp(n->op,"-")==0||strcmp(n->op,"~")==0){
             if(!type_is_numeric(et))
                 die("%s:%d: unary '%s' requires numeric type, got %s",n->file,n->line,n->op,type_name(et));
+            if(strcmp(n->op,"~")==0&&is_fp_type(et))
+                die("%s:%d: unary '~' is not defined for float/double",n->file,n->line);
             n->etype=et;
         }
         break;
@@ -1177,44 +1316,7 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
     case N_BINOP:{
         TypeRef *lt=tc_expr(n->left,ret);
         TypeRef *rt=tc_expr(n->right,ret);
-        const char *op=n->op;
-        /* comparison ops always return bool */
-        if(strcmp(op,"==")==0||strcmp(op,"!=")==0||
-           strcmp(op,"<")==0||strcmp(op,">")==0||
-           strcmp(op,"<=")==0||strcmp(op,">=")==0){
-            if(!types_compat(lt,rt))
-                die("%s:%d: cannot compare %s with %s",n->file,n->line,type_name(lt),type_name(rt));
-            n->etype=mktype(TY_BOOL,NULL,NULL);
-        }else if(strcmp(op,"and")==0||strcmp(op,"or")==0){
-            n->etype=mktype(TY_BOOL,NULL,NULL);
-        }else if(strcmp(op,"+")==0&&(lt->kind==TY_STR||rt->kind==TY_STR)){
-            /* str + str only allowed if both are str; otherwise error */
-            if(lt->kind!=TY_STR||rt->kind!=TY_STR)
-                die("%s:%d: cannot add str and %s — use str_concat()",n->file,n->line,
-                    lt->kind!=TY_STR?type_name(lt):type_name(rt));
-            /* rewrite as str_concat call in etype but keep node as binop */
-            n->etype=mktype(TY_STR,NULL,NULL);
-        }else{
-            if(!type_is_numeric(lt)||!type_is_numeric(rt)){
-                /* bitwise/arith — both must be numeric */
-                if(!type_is_numeric(lt))
-                    die("%s:%d: operator '%s' requires numeric left operand, got %s",
-                        n->file,n->line,op,type_name(lt));
-                if(!type_is_numeric(rt))
-                    die("%s:%d: operator '%s' requires numeric right operand, got %s",
-                        n->file,n->line,op,type_name(rt));
-            }
-            /* result is long if either side is long */
-            if(lt->kind==TY_LONG||rt->kind==TY_LONG)
-                n->etype=mktype(TY_LONG,NULL,NULL);
-            /* float/double propagation */
-            else if(lt->kind==TY_DOUBLE||rt->kind==TY_DOUBLE)
-                n->etype=mktype(TY_DOUBLE,NULL,NULL);
-            else if(lt->kind==TY_FLOAT||rt->kind==TY_FLOAT)
-                n->etype=mktype(TY_FLOAT,NULL,NULL);
-            else
-                n->etype=mktype(TY_INT,NULL,NULL);
-        }
+        tc_binop_finish(n,lt,rt);
         break;
     }
     case N_CALL:{
@@ -1255,15 +1357,30 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
             for(int i=0;i<n->args.n;i++){
                 TypeRef *at=n->args.d[i]->etype;
                 TypeRef *pt=sig->params.d[i].type;
-                if(!types_compat(at,pt))
+                if(!types_compat(at,pt)&&!types_compat(pt,at))
                     die("%s:%d: arg %d of '%s': expected %s, got %s",
                         n->file,n->line,i+1,n->callee,type_name(pt),type_name(at));
+                /* a str literal passed as an `int` parameter is allowed on purpose:
+                   bare-metal code takes pointers as ints (examples/EXAMPLE-OS). Only
+                   bool, which can't hold a pointer, is rejected. */
+                if(n->args.d[i]->kind==N_STRLIT&&pt&&pt->kind==TY_BOOL)
+                    die("%s:%d: arg %d of '%s': expected bool, got str",
+                        n->file,n->line,i+1,n->callee);
             }
             n->etype=sig->rettype;break;
         }
-        /* unknown — allow (runtime/external) with void type, warn */
-        warn("%s:%d: unknown function '%s' — assuming void",n->file,n->line,n->callee);
-        n->etype=mktype(TY_VOID,NULL,NULL);
+        /* unknown. Runtime-internal helpers (_flr_*) that have no entry in
+           builtin_rettype() are still allowed as untyped void calls; anything
+           else must be declared (`extern func f(...) -> T`) or defined. */
+        if(strncmp(n->callee,"_flr_",5)==0){
+            warn("%s:%d: unknown runtime function '%s' — assuming void",n->file,n->line,n->callee);
+            n->etype=mktype(TY_VOID,NULL,NULL);
+            break;
+        }
+        if(strcmp(n->callee,"print")==0)
+            die("%s:%d: unknown function 'print' (missing `import \"std\"`?)",n->file,n->line);
+        die("%s:%d: unknown function '%s' (declare it with `extern func %s(...) -> type`)",
+            n->file,n->line,n->callee,n->callee);
         break;
     }
     case N_INDEX:{
@@ -1317,6 +1434,92 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
     return n->etype;
 }
 
+/* Fold a global / static-local initializer to a constant. Handles integer,
+   long, bool and float/double literals, unary minus / bitwise-not on them
+   (`g: double = -1.5`), and converts to the variable's declared type (so
+   `g: double = 9` is 9.0, not 0.0). Returns 1 on success. */
+static int global_tvars_end=0x7fffffff;   /* tvars[0..global_tvars_end) are globals; anything above is a local in scope */
+static Node *fold_prog=NULL;   /* program being compiled: lets constant folding see global `const`s */
+static int fold_depth=0;
+static int fold_const(Node *e,int *is_fp,long long *iv,double *dv);
+static Node *find_gconst(const char *name){
+    if(!fold_prog)return NULL;
+    for(int i=0;i<fold_prog->body.n;i++){
+        Node *g=fold_prog->body.d[i];
+        if(g->kind==N_VARDECL&&g->is_gconst&&g->name&&!strcmp(g->name,name))return g;
+    }
+    return NULL;
+}
+static int fold_const(Node *e,int *is_fp,long long *iv,double *dv){
+    if(!e)return 0;
+    switch(e->kind){
+    case N_IDENT:{
+        Node *g=find_gconst(e->name);
+        if(!g||fold_depth>32)return 0;
+        /* a local variable of the same name shadows the global const; a local
+           isn't a compile-time constant, so don't silently use the global's value */
+        for(int i=ntvars-1;i>=global_tvars_end;i--)
+            if(strcmp(tvars[i].name,e->name)==0)return 0;
+        fold_depth++;int ok=fold_const(g->left,is_fp,iv,dv);fold_depth--;
+        if(!ok)return 0;
+        if(g->typeref&&is_fp_type(g->typeref)&&!*is_fp){*dv=(double)*iv;*is_fp=1;}
+        else if(g->typeref&&!is_fp_type(g->typeref)&&*is_fp)return 0;   /* ill-typed; reported when g itself is checked */
+        return 1;
+    }
+    case N_BINOP:{
+        int lf=0,rf=0;long long li=0,ri=0;double ld=0,rd=0;
+        if(!fold_const(e->left,&lf,&li,&ld)||!fold_const(e->right,&rf,&ri,&rd))return 0;
+        const char *op=e->op;
+        if(lf||rf){
+            double a=lf?ld:(double)li,b=rf?rd:(double)ri;
+            if     (!strcmp(op,"+"))*dv=a+b;
+            else if(!strcmp(op,"-"))*dv=a-b;
+            else if(!strcmp(op,"*"))*dv=a*b;
+            else if(!strcmp(op,"/")){if(b==0.0)return 0;*dv=a/b;}
+            else return 0;
+            *is_fp=1;return 1;
+        }
+        long long r;
+        if     (!strcmp(op,"+"))r=(long long)((unsigned long long)li+(unsigned long long)ri);
+        else if(!strcmp(op,"-"))r=(long long)((unsigned long long)li-(unsigned long long)ri);
+        else if(!strcmp(op,"*"))r=(long long)((unsigned long long)li*(unsigned long long)ri);
+        else if(!strcmp(op,"/")){if(ri==0||(ri==-1&&li==(-9223372036854775807LL-1)))return 0;r=li/ri;}
+        else if(!strcmp(op,"%")){if(ri==0||ri==-1)return ri==-1?(*iv=0,*is_fp=0,1):0;r=li%ri;}
+        else if(!strcmp(op,"&"))r=li&ri;
+        else if(!strcmp(op,"|"))r=li|ri;
+        else if(!strcmp(op,"^"))r=li^ri;
+        else if(!strcmp(op,"<<")){if(ri<0||ri>62)return 0;r=(long long)((unsigned long long)li<<ri);}
+        else if(!strcmp(op,">>")){if(ri<0||ri>63)return 0;r=li>>ri;}
+        else return 0;
+        *iv=r;*is_fp=0;return 1;
+    }
+    case N_INTLIT:case N_LONGLIT:case N_BOOLLIT:
+        *is_fp=0;*iv=(e->kind==N_BOOLLIT)?(e->bval?1:0):e->ival;return 1;
+    case N_FLOATLIT:case N_DOUBLELIT:
+        *is_fp=1;*dv=e->dval;return 1;
+    case N_UNOP:{
+        if(!fold_const(e->left,is_fp,iv,dv))return 0;
+        if(!strcmp(e->op,"-")){if(*is_fp)*dv=-*dv;else *iv=-*iv;return 1;}
+        if(!strcmp(e->op,"~")&&!*is_fp){*iv=~*iv;return 1;}
+        if(!strcmp(e->op,"not")){*iv=*is_fp?(*dv==0.0):(*iv==0);*is_fp=0;return 1;}
+        return 0;
+    }
+    default:return 0;
+    }
+}
+static void fold_global_init(Node *init,TypeRef *vt,long long *iv,double *dv,const char *name,Node *at){
+    *iv=0;*dv=0.0;
+    if(!init)return;
+    int fp=0;long long i=0;double d=0.0;
+    if(!fold_const(init,&fp,&i,&d)){
+        warn("%s:%d: initializer of global '%s' is not a compile-time constant; it will start at 0",
+             at->file,at->line,name);
+        return;
+    }
+    if(vt&&(vt->kind==TY_FLOAT||vt->kind==TY_DOUBLE)){*dv=fp?d:(double)i;}
+    else                                              {*iv=fp?(long long)d:i;}
+}
+
 static void tc_stmts(NList *stmts,TypeRef *ret_type,int in_loop);
 
 static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
@@ -1331,6 +1534,9 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
             if(decl&&!types_compat(decl,et))
                 die("%s:%d: cannot assign %s to variable '%s' of type %s",
                     n->file,n->line,type_name(et),n->name,type_name(decl));
+            check_strlit_dest(n->left,decl,"variable",n);
+            if(decl&&decl->kind==TY_ARRAY&&decl->elem&&n->left->kind==N_ARRAYLIT)
+                n->left->etype=decl;   /* elements are converted to the declared element type */
         }
         TypeRef *vt=decl?decl:(n->left?n->left->etype:mktype(TY_INT,NULL,NULL));
         if(n->is_static){
@@ -1348,19 +1554,14 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
                 gvars[ngvars].is_static=1;   /* always file-local — never exported */
                 gvars[ngvars].is_extern=0;
                 long long iv=0;double dv=0.0;
-                if(n->left&&(n->left->kind==N_INTLIT||n->left->kind==N_LONGLIT||n->left->kind==N_BOOLLIT))
-                    iv=n->left->ival;
-                else if(n->left&&(n->left->kind==N_FLOATLIT||n->left->kind==N_DOUBLELIT))
-                    dv=n->left->dval;
-                else if(n->left)
-                    warn("%s:%d: static local '%s' initializer is not a compile-time literal; it will start at 0",
-                        n->file,n->line,n->name);
+                fold_global_init(n->left,vt,&iv,&dv,n->name,n);
                 gvars[ngvars].ival=iv;
                 gvars[ngvars].dval=dv;
                 n->ival=ngvars; /* stash gvars index for statement codegen */
                 ngvars++;
             }
         }
+        check_redecl(n->name,n);
         push_tvar(n->name,vt);
         break;
     }
@@ -1371,6 +1572,8 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
         if(decl&&!types_compat(decl,et))
             die("%s:%d: cannot assign %s to const '%s' of type %s",
                 n->file,n->line,type_name(et),n->name,type_name(decl));
+        check_strlit_dest(n->left,decl,"const",n);
+        check_redecl(n->name,n);
         push_tvar_const(n->name,decl?decl:et);
         break;
     }
@@ -1390,11 +1593,27 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
         if(strcmp(n->op,"=")==0){
             if(!types_compat(lhs,rhs))
                 die("%s:%d: cannot assign %s to %s",n->file,n->line,type_name(rhs),type_name(lhs));
+            check_strlit_dest(n->right,lhs,"a variable",n);
+            if(lhs->kind==TY_ARRAY&&lhs->elem&&n->right->kind==N_ARRAYLIT)
+                n->right->etype=lhs;
         }else{
             /* compound assign: both sides must be numeric (or str for +=) */
             if(!type_is_numeric(lhs)&&!(strcmp(n->op,"+=")==0&&lhs->kind==TY_STR))
                 die("%s:%d: compound assignment requires numeric left operand, got %s",
                     n->file,n->line,type_name(lhs));
+            /* Desugar `x op= y` into `x = x op y`. The old per-backend
+               compound code only knew 32/64-bit integer ops, so `+=` on a
+               float, double or (x86-32) long silently did integer math on
+               the raw bits. A real binop gets the correct typing and
+               codegen for free. */
+            size_t ol=strlen(n->op);
+            char *bop=xstrndup(n->op,ol-1);
+            Node *b=calloc(1,sizeof*b);
+            b->kind=N_BINOP;b->line=n->line;b->file=n->file;
+            b->op=bop;b->left=n->left;b->right=n->right;
+            tc_binop_finish(b,lhs,rhs);
+            n->op=xstrdup("=");
+            n->right=b;
         }
         break;
     }
@@ -1403,15 +1622,21 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
         if(ret_type&&ret_type->kind!=TY_VOID&&!types_compat(ret_type,et))
             die("%s:%d: return type mismatch: function returns %s, got %s",
                 n->file,n->line,type_name(ret_type),type_name(et));
+        if(ret_type&&ret_type->kind==TY_VOID&&n->left&&et->kind!=TY_VOID)
+            die("%s:%d: return type mismatch: function returns void, got %s",
+                n->file,n->line,type_name(et));
+        check_strlit_dest(n->left,ret_type,"a return value",n);
         break;
     }
     case N_EXPRSTMT:tc_expr(n->left,ret_type);break;
     case N_IF:{
         TypeRef *ct=tc_expr(n->cond,ret_type);
         (void)ct;/* any type allowed in condition */
+        n->cond=fp_to_bool(n->cond);
         tc_stmts(&n->body,ret_type,in_loop);
         for(int i=0;i<n->elifs.n;i++){
             tc_expr(n->elifs.d[i].cond,ret_type);
+            n->elifs.d[i].cond=fp_to_bool(n->elifs.d[i].cond);
             tc_stmts(&n->elifs.d[i].body,ret_type,in_loop);
         }
         tc_stmts(&n->else_body,ret_type,in_loop);
@@ -1419,14 +1644,18 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
     }
     case N_WHILE:{
         tc_expr(n->cond,ret_type);
+        n->cond=fp_to_bool(n->cond);
         tc_stmts(&n->body,ret_type,1);
         break;
     }
     case N_FOR:{
+        int sv=ntvars,sb=scope_base;scope_base=ntvars;   /* init var lives only in the loop */
         tc_stmt(n->for_init,ret_type,0);
         tc_expr(n->cond,ret_type);
+        n->cond=fp_to_bool(n->cond);
         tc_stmt(n->for_post,ret_type,0);
         tc_stmts(&n->body,ret_type,1);
+        ntvars=sv;scope_base=sb;
         break;
     }
     case N_BREAK:case N_CONTINUE:
@@ -1437,10 +1666,101 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
 }
 
 static void tc_stmts(NList *stmts,TypeRef *ret_type,int in_loop){
+    /* every block is its own scope, matching the code generators, so names
+       declared inside an if/while/for body don't leak out */
+    int sv=ntvars,sb=scope_base;scope_base=ntvars;
     for(int i=0;i<stmts->n;i++)tc_stmt(stmts->d[i],ret_type,in_loop);
+    ntvars=sv;scope_base=sb;
+}
+
+/* Globals whose initializer is not a compile-time constant (array literals,
+   string literals, calls, ...) used to start at 0 with only a warning, so an
+   array global was a null pointer. Move each such initializer into an
+   assignment at the top of main(), in declaration order. */
+static void hoist_global_inits(Node *prog){
+    Node *mainfn=NULL;
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
+        if(n->kind==N_FUNC&&n->fname&&!strcmp(n->fname,"main")&&!n->is_extern){mainfn=n;break;}
+    }
+    if(!mainfn)return;
+    NList pre={0};
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
+        if(n->kind!=N_VARDECL||n->is_const!=2||n->is_extern||!n->left||!n->typeref)continue;
+        int fp=0;long long iv=0;double dv=0.0;
+        if(fold_const(n->left,&fp,&iv,&dv))continue;
+        Node *id=mknode(N_IDENT,n->line);id->name=xstrdup(n->name);id->file=n->file;
+        Node *as=mknode(N_ASSIGN,n->line);as->op=xstrdup("=");as->file=n->file;
+        as->left=id;as->right=n->left;
+        n->left=NULL;
+        nl_push(&pre,as);
+    }
+    if(!pre.n)return;
+    for(int i=0;i<mainfn->body.n;i++)nl_push(&pre,mainfn->body.d[i]);
+    free(mainfn->body.d);
+    mainfn->body=pre;
+}
+
+/* conservative "does every path through this block end in a return?" */
+static int block_returns(NList *b);
+static int stmt_returns(Node *n){
+    if(!n)return 0;
+    if(n->kind==N_RETURN)return 1;
+    if(n->kind==N_WHILE)   /* while (true) { ... } with no break never falls out */
+        return n->cond&&n->cond->kind==N_BOOLLIT&&n->cond->bval;
+    if(n->kind==N_IF){
+        if(!n->else_body.n)return 0;
+        if(!block_returns(&n->body))return 0;
+        for(int i=0;i<n->elifs.n;i++)if(!block_returns(&n->elifs.d[i].body))return 0;
+        return block_returns(&n->else_body);
+    }
+    return 0;
+}
+static int block_returns(NList *b){
+    for(int i=0;i<b->n;i++)if(stmt_returns(b->d[i]))return 1;
+    return 0;
+}
+
+/* two top-level definitions with the same name: an `extern` declaration may
+   coexist with the real definition, anything else is a redefinition */
+static void check_toplevel_dups(Node *prog){
+    int has_main=0;
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
+        int isf=(n->kind==N_FUNC);
+        int isg=(n->kind==N_VARDECL&&n->is_const==2);
+        if(!isf&&!isg)continue;
+        const char *nm=isf?n->fname:n->name;
+        if(isf&&nm&&!strcmp(nm,"main")&&!n->is_extern)has_main=1;
+        for(int j=0;j<i;j++){
+            Node *m=prog->body.d[j];
+            int mf=(m->kind==N_FUNC),mg=(m->kind==N_VARDECL&&m->is_const==2);
+            if(!(isf?mf:mg))continue;
+            const char *mn=mf?m->fname:m->name;
+            if(!nm||!mn||strcmp(nm,mn))continue;
+            if(n->is_extern||m->is_extern)continue;
+            die("%s:%d: %s '%s' is already defined (first defined at %s:%d)",
+                n->file,n->line,isf?"function":"global",nm,m->file,m->line);
+        }
+    }
+    if(!has_main)
+        warn("no 'main' function defined (fine for a library object; a linked program needs one)");
 }
 
 static void typecheck(Node *prog){
+    check_toplevel_dups(prog);
+    fold_prog=prog;
+    /* a global `const` must have a compile-time-constant initializer: it is
+       never hoisted into main() */
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
+        if(n->kind!=N_VARDECL||!n->is_gconst)continue;
+        int fp=0;long long iv=0;double dv=0.0;
+        if(!fold_const(n->left,&fp,&iv,&dv))
+            die("%s:%d: initializer of const '%s' is not a compile-time constant",n->file,n->line,n->name);
+    }
+    hoist_global_inits(prog);
     /* first pass: register all structs and function signatures */
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
@@ -1466,11 +1786,26 @@ static void typecheck(Node *prog){
             fsigs[nfsigs].params=n->params;
             nfsigs++;
         }
-        /* register top-level var declarations as globals in tvars so funcs can see them */
+    }
+    /* register top-level var declarations as globals in tvars so funcs can see
+       them (after all function signatures, so initializers may call any function) */
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
         if(n->kind==N_VARDECL&&n->is_const==2){
             TypeRef *vt=n->typeref;
-            if(!vt&&n->left){tc_expr(n->left,NULL);vt=n->left->etype;}
-            push_tvar(n->name,vt?vt:mktype(TY_INT,NULL,NULL));
+            if(n->left){
+                TypeRef *et=tc_expr(n->left,NULL);
+                if(!vt)vt=et;
+                else{
+                    if(!types_compat(vt,et))
+                        die("%s:%d: cannot assign %s to global '%s' of type %s",
+                            n->file,n->line,type_name(et),n->name,type_name(vt));
+                    check_strlit_dest(n->left,vt,"global",n);
+                    if(vt->kind==TY_ARRAY&&vt->elem&&n->left->kind==N_ARRAYLIT)n->left->etype=vt;
+                }
+            }
+            if(n->is_gconst)push_tvar_const(n->name,vt?vt:mktype(TY_INT,NULL,NULL));
+            else            push_tvar(n->name,vt?vt:mktype(TY_INT,NULL,NULL));
             /* also register into gvars for codegen */
             if(ngvars<4096){
                 gvars[ngvars].name=xstrdup(n->name);
@@ -1483,28 +1818,32 @@ static void typecheck(Node *prog){
                    supported; anything else stays zero and must be assigned
                    at runtime, as with e.g. a heap pointer from _flr_alloc) */
                 long long iv=0;double dv=0.0;
-                if(n->left&&(n->left->kind==N_INTLIT||n->left->kind==N_LONGLIT||n->left->kind==N_BOOLLIT))
-                    iv=n->left->ival;
-                else if(n->left&&(n->left->kind==N_FLOATLIT||n->left->kind==N_DOUBLELIT))
-                    dv=n->left->dval;
+                fold_global_init(n->left,vt,&iv,&dv,n->name,n);
                 gvars[ngvars].ival=iv;
                 gvars[ngvars].dval=dv;
                 ngvars++;
             }
         }
     }
+    global_tvars_end=ntvars;
     /* second pass: type-check each function body */
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
         if(n->kind!=N_FUNC)continue;
         int saved_ntvars=ntvars;
+        scope_base=ntvars;   /* params form the outermost local scope */
         /* push params into scope */
-        for(int j=0;j<n->params.n;j++)
+        for(int j=0;j<n->params.n;j++){
+            check_redecl(n->params.d[j].name,n);
             push_tvar(n->params.d[j].name,n->params.d[j].type);
+        }
         cur_fn_name=n->fname;
         tc_stmts(&n->body,n->rettype,0);
+        if(n->rettype&&n->rettype->kind!=TY_VOID&&!n->is_extern&&!block_returns(&n->body))
+            warn("%s:%d: control reaches end of non-void function '%s'",n->file,n->line,n->fname);
         cur_fn_name=NULL;
         ntvars=saved_ntvars;/* pop function scope */
+        scope_base=0;
     }
 }
 
@@ -1631,6 +1970,36 @@ static void need_long_helpers(void){
     out("    testb $32,%%cl\n    je .Llshr_done\n");
     out("    movl %%edx,%%eax\n    sarl $31,%%edx\n");
     out(".Llshr_done:\n    ret\n\n");
+    /* _flr_udivmod64: edx:eax / ecx:ebx (both unsigned) -> quotient edx:eax,
+       remainder esi:edi.  Plain 64-step shift-subtract; clobbers ecx/ebx
+       only by reading them. */
+    out("_flr_udivmod64:\n");
+    out("    xorl %%esi,%%esi\n    xorl %%edi,%%edi\n    pushl $64\n");
+    out(".Ludm_l:\n    shll $1,%%eax\n    rcll $1,%%edx\n    rcll $1,%%edi\n    rcll $1,%%esi\n");
+    out("    cmpl %%ecx,%%esi\n    jb .Ludm_s\n    ja .Ludm_sub\n    cmpl %%ebx,%%edi\n    jb .Ludm_s\n");
+    out(".Ludm_sub:\n    subl %%ebx,%%edi\n    sbbl %%ecx,%%esi\n    orl $1,%%eax\n");
+    out(".Ludm_s:\n    decl (%%esp)\n    jne .Ludm_l\n    addl $4,%%esp\n    ret\n\n");
+    /* _flr_ldiv / _flr_lmod (alo,ahi,blo,bhi): signed, truncating toward zero;
+       remainder takes the dividend's sign (same as C). */
+    for(int rem=0;rem<2;rem++){
+        const char *nm=rem?"lmod":"ldiv";
+        out("_flr_%s:\n",nm);
+        out("    pushl %%ebp\n    movl %%esp,%%ebp\n    pushl %%ebx\n    pushl %%esi\n    pushl %%edi\n    subl $8,%%esp\n");
+        out("    movl 8(%%ebp),%%eax\n    movl 12(%%ebp),%%edx\n    movl 16(%%ebp),%%ebx\n    movl 20(%%ebp),%%ecx\n");
+        out("    movl %%edx,-16(%%ebp)\n    movl %%ecx,-20(%%ebp)\n");
+        /* divisor == 0: raise #DE (SIGFPE), matching the 64-bit path */
+        out("    movl %%ebx,%%esi\n    orl %%ecx,%%esi\n    jnz .L%s_nz\n    xorl %%esi,%%esi\n    divl %%esi\n.L%s_nz:\n",nm,nm);
+        out("    testl %%edx,%%edx\n    jns .L%s_a\n    negl %%eax\n    adcl $0,%%edx\n    negl %%edx\n.L%s_a:\n",nm,nm);
+        out("    testl %%ecx,%%ecx\n    jns .L%s_b\n    negl %%ebx\n    adcl $0,%%ecx\n    negl %%ecx\n.L%s_b:\n",nm,nm);
+        out("    call _flr_udivmod64\n");
+        if(rem){
+            out("    movl %%edi,%%eax\n    movl %%esi,%%edx\n    cmpl $0,-16(%%ebp)\n    jge .L%s_d\n",nm);
+        }else{
+            out("    movl -16(%%ebp),%%ecx\n    xorl -20(%%ebp),%%ecx\n    jns .L%s_d\n",nm);
+        }
+        out("    negl %%eax\n    adcl $0,%%edx\n    negl %%edx\n.L%s_d:\n",nm);
+        out("    addl $8,%%esp\n    popl %%edi\n    popl %%esi\n    popl %%ebx\n    leave\n    ret\n\n");
+    }
     /* _flr_lprint(lo,hi) — print signed 64-bit integer */
     out("_flr_lprint:\n");
     out("    pushl %%ebp\n    movl %%esp,%%ebp\n");
@@ -1677,13 +2046,68 @@ static void need_long_helpers(void){
 }
 
 /* push a long variable: pushes hi then lo (so lo is at lower address on stack) */
-static void push_long_var(int off){
-    /* off is the LOW word offset (as returned by alloc_var for long) */
-    out("    pushl %d(%%ebp)\n",off+4); /* hi */
-    out("    pushl %d(%%ebp)\n",off);   /* lo */
-}
 
 /* ── hardware intrinsics ──────────────────────────────────────────── */
+/* ── x86-32 value representation ────────────────────────────────────
+   int/bool/ptr/str/struct/float(bit pattern) : eax
+   long / double(bit pattern)                 : edx:eax
+   The helpers below convert between those representations and the x87. */
+static TypeRef *cur_ret_type=NULL;   /* return type of the function being generated */
+
+enum{K_I=0,K_L=1,K_F=2,K_D=3};
+static int kcls(TypeRef *t){
+    if(!t)return K_I;
+    if(t->kind==TY_LONG)  return K_L;
+    if(t->kind==TY_FLOAT) return K_F;
+    if(t->kind==TY_DOUBLE)return K_D;
+    return K_I;
+}
+static int slot32(TypeRef *t){int k=kcls(t);return (k==K_L||k==K_D)?8:4;}
+
+/* push the value currently in eax / edx:eax onto the CPU stack in its native size */
+static void spill32(TypeRef *t){
+    if(slot32(t)==8)out("    pushl %%edx\n    pushl %%eax\n");
+    else            out("    pushl %%eax\n");
+}
+/* x87 load of a native-typed value that is sitting at (%esp) */
+static void fld_mem32(TypeRef *t){
+    switch(kcls(t)){
+    case K_L:out("    fildll (%%esp)\n");break;
+    case K_F:out("    flds (%%esp)\n");break;
+    case K_D:out("    fldl (%%esp)\n");break;
+    default: out("    fildl (%%esp)\n");break;   /* NB: `filds` is the 16-bit load */
+    }
+}
+/* x87 load of the native-typed value currently in the registers */
+static void fld_reg32(TypeRef *t){
+    spill32(t);fld_mem32(t);out("    addl $%d,%%esp\n",slot32(t));
+}
+/* pop st(0) into the registers as a float / double bit pattern */
+static void fstp_reg32(int to_double){
+    if(to_double)out("    subl $8,%%esp\n    fstpl (%%esp)\n    popl %%eax\n    popl %%edx\n");
+    else         out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
+}
+/* pop st(0) into the registers as an int (to_long=0) or long (to_long=1),
+   truncating toward zero like a C cast */
+static void fistp_trunc_reg32(int to_long){
+    out("    subl $16,%%esp\n    fnstcw 8(%%esp)\n    movzwl 8(%%esp),%%eax\n");
+    out("    orl $0x0c00,%%eax\n    movw %%ax,10(%%esp)\n    fldcw 10(%%esp)\n");
+    out(to_long?"    fistpll (%%esp)\n":"    fistpl (%%esp)\n");
+    out("    fldcw 8(%%esp)\n    movl (%%esp),%%eax\n");
+    if(to_long)out("    movl 4(%%esp),%%edx\n");
+    out("    addl $16,%%esp\n");
+}
+/* convert the value in the registers from type `from` to type `to` */
+static void gen_convert32(TypeRef *from,TypeRef *to){
+    int f=kcls(from),t=kcls(to);
+    if(f==t)return;
+    if(f==K_I&&t==K_L){out("    cdq\n");return;}
+    if(f==K_L&&t==K_I)return;                       /* low word is already in eax */
+    if(t==K_F||t==K_D){fld_reg32(from);fstp_reg32(t==K_D);return;}
+    /* float/double -> int/long */
+    fld_reg32(from);fistp_trunc_reg32(t==K_L);
+}
+
 static void gen_intrinsic(Node *n){
     const char *nm=n->callee;
     if(strcmp(nm,"__syscall")==0){
@@ -1767,17 +2191,13 @@ static void gen_expr(Node *n){
     case N_BOOLLIT:
         out("    movl $%d,%%eax\n",n->bval?1:0);break;
     case N_FLOATLIT:{
-        /* store float constant in rodata, load with flds, push as int bits via st(0) */
-        int idx=add_flit(n->dval,0);
-        out("    flds .Lfl%d\n",idx);
-        out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");break;
+        /* the IEEE-754 bit pattern is just an immediate in eax */
+        union{float f;unsigned u;}cv;cv.f=(float)n->dval;
+        out("    movl $%u,%%eax\n",cv.u);break;
     }
     case N_DOUBLELIT:{
-        int idx=add_flit(n->dval,1);
-        out("    fldl .Lfl%d\n",idx);
-        /* return in edx:eax (push 8 bytes, pop lo then hi) */
-        out("    subl $8,%%esp\n    fstpl (%%esp)\n");
-        out("    popl %%eax\n    popl %%edx\n");break;
+        union{double d;unsigned u[2];}cv;cv.d=n->dval;
+        out("    movl $%u,%%eax\n    movl $%u,%%edx\n",cv.u[0],cv.u[1]);break;
     }
     case N_STRLIT:
         out("    leal .Lstr%d,%%eax\n",add_strlit(n->sval));break;
@@ -1787,42 +2207,43 @@ static void gen_expr(Node *n){
         int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
         if(gidx>=0){
             /* global variable */
-            if(v->type&&v->type->kind==TY_FLOAT){
-                out("    flds _gv_%s\n",gvars[gidx].name);
-                out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
-            } else if(v->type&&v->type->kind==TY_DOUBLE){
-                out("    fldl _gv_%s\n",gvars[gidx].name);
-                out("    subl $8,%%esp\n    fstpl (%%esp)\n");
-                out("    popl %%eax\n    popl %%edx\n");
-            } else {
-                out("    movl _gv_%s,%%eax\n",gvars[gidx].name);
-                if(v->type&&v->type->kind==TY_LONG)
-                    out("    movl _gv_%s+4,%%edx\n",gvars[gidx].name);
-            }
-        } else if(v->type&&v->type->kind==TY_FLOAT){
-            out("    flds %d(%%ebp)\n",v->offset);
-            out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
-        } else if(v->type&&v->type->kind==TY_DOUBLE){
-            out("    fldl %d(%%ebp)\n",v->offset);
-            out("    subl $8,%%esp\n    fstpl (%%esp)\n");
-            out("    popl %%eax\n    popl %%edx\n");
+            out("    movl _gv_%s,%%eax\n",gvars[gidx].name);
+            if(slot32(v->type)==8)
+                out("    movl _gv_%s+4,%%edx\n",gvars[gidx].name);
         } else {
             out("    movl %d(%%ebp),%%eax\n",v->offset);
-            if(v->type&&v->type->kind==TY_LONG)
+            if(slot32(v->type)==8)
                 out("    movl %d(%%ebp),%%edx\n",v->offset+4);
         }
         break;
     }
     case N_BINOP:{
         const char *op=n->op;
+        /* `and` / `or` short-circuit: the right operand is only evaluated
+           when the left one doesn't already decide the result. */
+        if(strcmp(op,"and")==0||strcmp(op,"or")==0){
+            int is_and=(op[0]=='a');
+            int Lsc=new_label();
+            gen_expr(n->left);
+            if(n->left->etype&&n->left->etype->kind==TY_LONG)out("    orl %%edx,%%eax\n");
+            else out("    testl %%eax,%%eax\n");
+            out(is_and?"    jz .Lscs%d\n":"    jnz .Lscs%d\n",Lsc);
+            gen_expr(n->right);
+            if(n->right->etype&&n->right->etype->kind==TY_LONG)out("    orl %%edx,%%eax\n");
+            else out("    testl %%eax,%%eax\n");
+            out(is_and?"    jz .Lscs%d\n":"    jnz .Lscs%d\n",Lsc);
+            out("    movl $%d,%%eax\n    jmp .Lsce%d\n",is_and?1:0,Lsc);
+            out(".Lscs%d:\n    movl $%d,%%eax\n.Lsce%d:\n",Lsc,is_and?0:1,Lsc);
+            break;
+        }
         int is_long=(n->etype&&n->etype->kind==TY_LONG);
         int llong=(n->left&&n->left->etype&&n->left->etype->kind==TY_LONG);
         int rlong=(n->right&&n->right->etype&&n->right->etype->kind==TY_LONG);
 
         /* str + str → str_concat */
         if(strcmp(op,"+")==0&&n->left->etype&&n->left->etype->kind==TY_STR){
-            gen_expr(n->right);out("    pushl %%eax\n");
             gen_expr(n->left);out("    pushl %%eax\n");
+            gen_expr(n->right);out("    popl %%ecx\n    pushl %%eax\n    pushl %%ecx\n");
             out("    call _flr_str_concat\n    addl $8,%%esp\n");
             break;
         }
@@ -1830,70 +2251,65 @@ static void gen_expr(Node *n){
         int is_fp=(n->etype&&(n->etype->kind==TY_FLOAT||n->etype->kind==TY_DOUBLE));
         int lf=(n->left&&n->left->etype&&(n->left->etype->kind==TY_FLOAT||n->left->etype->kind==TY_DOUBLE));
         int rf=(n->right&&n->right->etype&&(n->right->etype->kind==TY_FLOAT||n->right->etype->kind==TY_DOUBLE));
-        int use_dbl=(n->etype&&n->etype->kind==TY_DOUBLE)||
-                    (n->left&&n->left->etype&&n->left->etype->kind==TY_DOUBLE)||
-                    (n->right&&n->right->etype&&n->right->etype->kind==TY_DOUBLE);
         if(is_fp||lf||rf){
-            /* push rhs as float/double onto x87 stack */
-            gen_expr(n->right);
-            if(rf&&use_dbl&&n->right->etype&&n->right->etype->kind==TY_DOUBLE){
-                out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-            } else if(rf){
-                out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-                if(use_dbl)out("    fldl .Lfl_zero\n    faddp\n"); /* widen to double */
-            } else {
-                /* int/long operand: convert via fild */
-                out("    pushl %%eax\n    filds (%%esp)\n    addl $4,%%esp\n");
-            }
-            /* push lhs */
-            gen_expr(n->left);
-            if(lf&&use_dbl&&n->left->etype&&n->left->etype->kind==TY_DOUBLE){
-                out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-            } else if(lf){
-                out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-                if(use_dbl)out("    fldl .Lfl_zero\n    faddp\n");
-            } else {
-                out("    pushl %%eax\n    filds (%%esp)\n    addl $4,%%esp\n");
-            }
-            /* st(0)=lhs, st(1)=rhs; operate */
+            /* The right operand is spilled to the CPU stack in its native
+               form while the left is evaluated, so the 8-entry x87 stack
+               never holds more than two values no matter how deeply the
+               expression nests. Left ends up in st(0) and right in st(1)
+               (or the reverse for < and <=, see below). */
+            TypeRef *lt=n->left->etype,*rt=n->right->etype;
             int is_cmp=(!strcmp(op,"==")||!strcmp(op,"!=")||!strcmp(op,"<")||!strcmp(op,">")||!strcmp(op,"<=")||!strcmp(op,">="));
-            if(!strcmp(op,"+")) out("    faddp\n");
-            else if(!strcmp(op,"-")) out("    fsubrp\n");
-            else if(!strcmp(op,"*")) out("    fmulp\n");
-            else if(!strcmp(op,"/")) out("    fdivrp\n");
-            else if(is_cmp){
-                int lc=new_label();
+            int swap=(!strcmp(op,"<")||!strcmp(op,"<="));
+            gen_expr(n->left);spill32(lt);
+            gen_expr(n->right);
+            if(!swap){
+                fld_reg32(rt);                                          /* st0=right */
+                fld_mem32(lt);out("    addl $%d,%%esp\n",slot32(lt));  /* st0=left, st1=right */
+            }else{
+                fld_mem32(lt);out("    addl $%d,%%esp\n",slot32(lt));  /* st0=left */
+                fld_reg32(rt);                                          /* st0=right, st1=left */
+            }
+            if(is_cmp){
+                /* fucomip sets CF/ZF/PF like an unsigned compare of st0 with
+                   st1; an unordered result (NaN) sets all three. `<` and `<=`
+                   are evaluated as the swapped `>` / `>=` so that NaN makes
+                   them false (CF=1 fails seta/setae); == and != also look at PF. */
                 out("    fucomip %%st(1),%%st\n    fstp %%st(0)\n");
-                if(!strcmp(op,"==")){out("    sete %%al\n");}
-                else if(!strcmp(op,"!=")){out("    setne %%al\n");}
-                else if(!strcmp(op,"<")) {out("    setb %%al\n");}
-                else if(!strcmp(op,">")) {out("    seta %%al\n");}
-                else if(!strcmp(op,"<=")){out("    setbe %%al\n");}
-                else if(!strcmp(op,">=")){out("    setae %%al\n");}
+                if     (!strcmp(op,"==")) out("    sete %%al\n    setnp %%cl\n    andb %%cl,%%al\n");
+                else if(!strcmp(op,"!=")) out("    setne %%al\n    setp %%cl\n    orb %%cl,%%al\n");
+                else if(!strcmp(op,"<")||!strcmp(op,">")) out("    seta %%al\n");
+                else                                      out("    setae %%al\n");
                 out("    movzbl %%al,%%eax\n");
                 break;
             }
-            else die("unsupported float operator '%s'",op);
-            /* store result back to eax (float) or edx:eax (double) */
-            if(use_dbl){
-                out("    subl $8,%%esp\n    fstpl (%%esp)\n");
-                out("    popl %%eax\n    popl %%edx\n");
-            } else {
-                out("    subl $4,%%esp\n    fstps (%%esp)\n    popl %%eax\n");
+            /* st0=left, st1=right. AT&T `fsubp`/`fdivp` (no operands) compute st0-st1 and st0/st1. */
+            if     (!strcmp(op,"+")) out("    faddp\n");
+            else if(!strcmp(op,"-")) out("    fsubp\n");
+            else if(!strcmp(op,"*")) out("    fmulp\n");
+            else if(!strcmp(op,"/")) out("    fdivp\n");
+            else if(!strcmp(op,"%")){
+                /* C fmod: fprem leaves a truncated remainder (sign of the dividend);
+                   repeat while C2 says the reduction is incomplete. */
+                int L=new_label();
+                out(".Lfmod%d:\n    fprem\n    fnstsw %%ax\n    testb $4,%%ah\n    jnz .Lfmod%d\n    fstp %%st(1)\n",L,L);
             }
+            else die("%s:%d: operator '%s' is not defined for float/double",n->file,n->line,op);
+            fstp_reg32(n->etype&&n->etype->kind==TY_DOUBLE);
             break;
         }
 
         if(is_long||llong||rlong){
             need_long_helpers();
-            /* push rhs */
-            gen_expr(n->right);
-            if(rlong){out("    pushl %%edx\n    pushl %%eax\n");}
-            else     {out("    cdq\n    pushl %%edx\n    pushl %%eax\n");}
-            /* push lhs */
+            /* evaluate lhs first (left-to-right), park it on the stack, then
+               evaluate rhs and re-push both so the helpers see lhs on top */
             gen_expr(n->left);
             if(llong){out("    pushl %%edx\n    pushl %%eax\n");}
             else     {out("    cdq\n    pushl %%edx\n    pushl %%eax\n");}
+            gen_expr(n->right);
+            if(!rlong)out("    cdq\n");
+            out("    popl %%ecx\n    popl %%esi\n");          /* lhs lo,hi */
+            out("    pushl %%edx\n    pushl %%eax\n");        /* rhs */
+            out("    pushl %%esi\n    pushl %%ecx\n");        /* lhs on top */
 
             if(strcmp(op,"+")==0){
                 out("    call _flr_ladd\n    addl $16,%%esp\n");
@@ -1905,6 +2321,23 @@ static void gen_expr(Node *n){
                 out("    call _flr_lshl\n    addl $16,%%esp\n");
             }else if(strcmp(op,">>")==0){
                 out("    call _flr_lshr\n    addl $16,%%esp\n");
+            }else if(strcmp(op,"/")==0){
+                out("    call _flr_ldiv\n    addl $16,%%esp\n");
+            }else if(strcmp(op,"%")==0){
+                out("    call _flr_lmod\n    addl $16,%%esp\n");
+            }else if(!strcmp(op,"&")||!strcmp(op,"|")||!strcmp(op,"^")||!strcmp(op,"and")||!strcmp(op,"or")){
+                out("    popl %%eax\n    popl %%edx\n"); /* lhs lo,hi */
+                out("    popl %%ecx\n    popl %%esi\n"); /* rhs lo,hi */
+                if(!strcmp(op,"&"))      out("    andl %%ecx,%%eax\n    andl %%esi,%%edx\n");
+                else if(!strcmp(op,"|")) out("    orl %%ecx,%%eax\n    orl %%esi,%%edx\n");
+                else if(!strcmp(op,"^")) out("    xorl %%ecx,%%eax\n    xorl %%esi,%%edx\n");
+                else if(!strcmp(op,"and")){
+                    out("    orl %%edx,%%eax\n    setne %%al\n    orl %%esi,%%ecx\n    setne %%cl\n");
+                    out("    andb %%cl,%%al\n    movzbl %%al,%%eax\n    xorl %%edx,%%edx\n");
+                }else{
+                    out("    orl %%edx,%%eax\n    orl %%esi,%%ecx\n    orl %%ecx,%%eax\n    setne %%al\n");
+                    out("    movzbl %%al,%%eax\n    xorl %%edx,%%edx\n");
+                }
             }else{
                 /* comparison: compare hi then lo */
                 out("    popl %%eax\n    popl %%edx\n"); /* lhs lo,hi */
@@ -1920,17 +2353,25 @@ static void gen_expr(Node *n){
                     out("    cmpl %%ecx,%%eax\n");
                     out(".Llcmp%d:\n    setne %%al\n    movzbl %%al,%%eax\n",l);
                 }else if(strcmp(op,"<")==0){
-                    out("    jne .Llcmp%d\n",l);out("    cmpl %%ecx,%%eax\n");
-                    out(".Llcmp%d:\n    setl %%al\n    movzbl %%al,%%eax\n",l);
+                    int d=new_label(),z=new_label();
+                    out("    jl .Llcmp%d\n    jg .Llcmp%d\n",l,z);
+                    out("    cmpl %%ecx,%%eax\n    setb %%al\n    movzbl %%al,%%eax\n    jmp .Llcmp%d\n",d);
+                    out(".Llcmp%d:\n    movl $1,%%eax\n    jmp .Llcmp%d\n.Llcmp%d:\n    xorl %%eax,%%eax\n.Llcmp%d:\n",l,d,z,d);
                 }else if(strcmp(op,">")==0){
-                    out("    jne .Llcmp%d\n",l);out("    cmpl %%ecx,%%eax\n");
-                    out(".Llcmp%d:\n    setg %%al\n    movzbl %%al,%%eax\n",l);
+                    int d=new_label(),z=new_label();
+                    out("    jg .Llcmp%d\n    jl .Llcmp%d\n",l,z);
+                    out("    cmpl %%ecx,%%eax\n    seta %%al\n    movzbl %%al,%%eax\n    jmp .Llcmp%d\n",d);
+                    out(".Llcmp%d:\n    movl $1,%%eax\n    jmp .Llcmp%d\n.Llcmp%d:\n    xorl %%eax,%%eax\n.Llcmp%d:\n",l,d,z,d);
                 }else if(strcmp(op,"<=")==0){
-                    out("    jne .Llcmp%d\n",l);out("    cmpl %%ecx,%%eax\n");
-                    out(".Llcmp%d:\n    setle %%al\n    movzbl %%al,%%eax\n",l);
+                    int d=new_label(),z=new_label();
+                    out("    jl .Llcmp%d\n    jg .Llcmp%d\n",l,z);
+                    out("    cmpl %%ecx,%%eax\n    setbe %%al\n    movzbl %%al,%%eax\n    jmp .Llcmp%d\n",d);
+                    out(".Llcmp%d:\n    movl $1,%%eax\n    jmp .Llcmp%d\n.Llcmp%d:\n    xorl %%eax,%%eax\n.Llcmp%d:\n",l,d,z,d);
                 }else if(strcmp(op,">=")==0){
-                    out("    jne .Llcmp%d\n",l);out("    cmpl %%ecx,%%eax\n");
-                    out(".Llcmp%d:\n    setge %%al\n    movzbl %%al,%%eax\n",l);
+                    int d=new_label(),z=new_label();
+                    out("    jg .Llcmp%d\n    jl .Llcmp%d\n",l,z);
+                    out("    cmpl %%ecx,%%eax\n    setae %%al\n    movzbl %%al,%%eax\n    jmp .Llcmp%d\n",d);
+                    out(".Llcmp%d:\n    movl $1,%%eax\n    jmp .Llcmp%d\n.Llcmp%d:\n    xorl %%eax,%%eax\n.Llcmp%d:\n",l,d,z,d);
                 }else{
                     die("unsupported long operator '%s'",op);
                 }
@@ -1939,8 +2380,8 @@ static void gen_expr(Node *n){
         }
 
         /* normal 32-bit */
-        gen_expr(n->right);out("    pushl %%eax\n");
-        gen_expr(n->left); out("    popl %%ecx\n");
+        gen_expr(n->left);out("    pushl %%eax\n");
+        gen_expr(n->right);out("    movl %%eax,%%ecx\n    popl %%eax\n");
         if     (strcmp(op,"+")==0) out("    addl %%ecx,%%eax\n");
         else if(strcmp(op,"-")==0) out("    subl %%ecx,%%eax\n");
         else if(strcmp(op,"*")==0) out("    imull %%ecx,%%eax\n");
@@ -1983,8 +2424,15 @@ static void gen_expr(Node *n){
             out("    xorl $0x80000000,%%edx\n");
         }
         else if     (strcmp(n->op,"-"  )==0)out("    negl %%eax\n");
-        else if(strcmp(n->op,"~"  )==0)out("    notl %%eax\n");
-        else if(strcmp(n->op,"not")==0){out("    testl %%eax,%%eax\n");out("    sete %%al\n");out("    movzbl %%al,%%eax\n");}
+        else if(strcmp(n->op,"~"  )==0){
+            out("    notl %%eax\n");
+            if(n->left->etype&&n->left->etype->kind==TY_LONG)out("    notl %%edx\n");
+        }
+        else if(strcmp(n->op,"not")==0){
+            if(n->left->etype&&n->left->etype->kind==TY_LONG)out("    orl %%edx,%%eax\n");
+            else out("    testl %%eax,%%eax\n");
+            out("    sete %%al\n    movzbl %%al,%%eax\n");
+        }
         break;
     case N_CALL:{
         if(is_intrinsic(n->callee)){gen_intrinsic(n);break;}
@@ -2038,32 +2486,54 @@ static void gen_expr(Node *n){
                 break;
             }
         }
-        for(int i=n->args.n-1;i>=0;i--){gen_expr(n->args.d[i]);out("    pushl %%eax\n");}
-        out("    call %s\n",n->callee);
-        if(n->args.n>0)out("    addl $%d,%%esp\n",n->args.n*4);
+        {
+            /* Arguments are converted to the callee's declared parameter
+               types (int->double etc.) and long/double take 8 bytes. */
+            FuncSig *sig=find_func(n->callee);
+            int total=0;
+            for(int i=n->args.n-1;i>=0;i--){
+                Node *a=n->args.d[i];
+                TypeRef *pt=(sig&&i<sig->params.n)?sig->params.d[i].type:a->etype;
+                gen_expr(a);
+                gen_convert32(a->etype,pt);
+                spill32(pt);total+=slot32(pt);
+            }
+            out("    call %s\n",n->callee);
+            if(total>0)out("    addl $%d,%%esp\n",total);
+        }
         break;
     }
-    case N_INDEX:
+    case N_INDEX:{
+        int esz=slot32(n->etype);   /* 8 for long/double elements, else 4 */
         gen_expr(n->right);out("    pushl %%eax\n");
         gen_expr(n->left); out("    popl %%ecx\n");
-        out("    leal 8(%%eax,%%ecx,4),%%eax\n");
-        out("    movl (%%eax),%%eax\n");break;
+        out("    leal 8(%%eax,%%ecx,%d),%%ecx\n",esz);
+        if(esz==8)out("    movl 4(%%ecx),%%edx\n");
+        out("    movl (%%ecx),%%eax\n");break;
+    }
     case N_FIELD:{
         gen_expr(n->left);
         int found_off=field_offset(n->left,n->sval,4);
+        if(slot32(n->etype)==8)out("    movl %d(%%eax),%%edx\n",found_off+4);
         out("    movl %d(%%eax),%%eax\n",found_off);break;
     }
     case N_ARRAYLIT:{
-        int cnt=n->elems.n,alloc_sz=8+cnt*4;
+        TypeRef *elt=(n->etype&&n->etype->kind==TY_ARRAY&&n->etype->elem)?n->etype->elem:NULL;
+        int esz=slot32(elt);
+        int cnt=n->elems.n,alloc_sz=8+cnt*esz;
         /* use sbrk(alloc_sz) via sys_brk trick: just call _flr_alloc */
         out("    pushl $%d\n",alloc_sz);
         out("    call _flr_alloc\n    addl $4,%%esp\n");
         out("    pushl %%eax\n");
         out("    movl $%d,(%%eax)\n    movl $%d,4(%%eax)\n",cnt,cnt);
         for(int i=0;i<cnt;i++){
-            out("    movl (%%esp),%%edi\n");
             gen_expr(n->elems.d[i]);
-            out("    movl %%eax,%d(%%edi)\n",8+i*4);
+            gen_convert32(n->elems.d[i]->etype,elt);
+            /* reload the array base AFTER evaluating the element (a nested
+               literal or call would have clobbered a cached register) */
+            out("    movl (%%esp),%%ecx\n");
+            out("    movl %%eax,%d(%%ecx)\n",8+i*esz);
+            if(esz==8)out("    movl %%edx,%d(%%ecx)\n",8+i*esz+4);
         }
         out("    popl %%eax\n");break;
     }
@@ -2072,46 +2542,40 @@ static void gen_expr(Node *n){
 }
 
 static void gen_store(Node *lv){
+    /* the value to store is in eax (edx:eax for long/double), already
+       converted to the lvalue's type */
+    int w8=(slot32(lv->etype)==8);
     switch(lv->kind){
     case N_IDENT:{
         Var *v=find_var(lv->name);
         if(!v)die("%s:%d: undefined variable '%s'",lv->file,lv->line,lv->name);
         int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
+        w8=(slot32(v->type)==8);
         if(gidx>=0){
-            if(v->type&&v->type->kind==TY_FLOAT){
-                out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-                out("    fstps _gv_%s\n",gvars[gidx].name);
-            } else if(v->type&&v->type->kind==TY_DOUBLE){
-                out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-                out("    fstpl _gv_%s\n",gvars[gidx].name);
-            } else {
-                out("    movl %%eax,_gv_%s\n",gvars[gidx].name);
-                if(v->type&&v->type->kind==TY_LONG)
-                    out("    movl %%edx,_gv_%s+4\n",gvars[gidx].name);
-            }
-        } else if(v->type&&v->type->kind==TY_FLOAT){
-            out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-            out("    fstps %d(%%ebp)\n",v->offset);
-        } else if(v->type&&v->type->kind==TY_DOUBLE){
-            out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-            out("    fstpl %d(%%ebp)\n",v->offset);
+            out("    movl %%eax,_gv_%s\n",gvars[gidx].name);
+            if(w8)out("    movl %%edx,_gv_%s+4\n",gvars[gidx].name);
         } else {
             out("    movl %%eax,%d(%%ebp)\n",v->offset);
-            if(v->type&&v->type->kind==TY_LONG)
-                out("    movl %%edx,%d(%%ebp)\n",v->offset+4);
+            if(w8)out("    movl %%edx,%d(%%ebp)\n",v->offset+4);
         }
         break;
     }
     case N_INDEX:
+        if(w8)out("    pushl %%edx\n");
         out("    pushl %%eax\n");
         gen_expr(lv->right);out("    pushl %%eax\n");
         gen_expr(lv->left); out("    popl %%ecx\n");
-        out("    leal 8(%%eax,%%ecx,4),%%edx\n");
-        out("    popl %%eax\n    movl %%eax,(%%edx)\n");break;
+        out("    leal 8(%%eax,%%ecx,%d),%%ecx\n",w8?8:4);
+        out("    popl %%eax\n");
+        if(w8)out("    popl %%edx\n    movl %%edx,4(%%ecx)\n");
+        out("    movl %%eax,(%%ecx)\n");break;
     case N_FIELD:{
+        if(w8)out("    pushl %%edx\n");
         out("    pushl %%eax\n");gen_expr(lv->left);
         int found_off=field_offset(lv->left,lv->sval,4);
-        out("    popl %%ecx\n    movl %%ecx,%d(%%eax)\n",found_off);break;
+        out("    popl %%ecx\n");
+        if(w8)out("    popl %%edx\n    movl %%edx,%d(%%eax)\n",found_off+4);
+        out("    movl %%ecx,%d(%%eax)\n",found_off);break;
     }
     default:die("gen_store: not an lvalue");
     }
@@ -2142,46 +2606,27 @@ static void gen_stmt(Node *n){
         int off=alloc_var(n->name,vtype);
         if(n->left){
             gen_expr(n->left);
-            if(vtype&&vtype->kind==TY_FLOAT){
-                /* eax holds float bits; store with flds/fstps */
-                out("    pushl %%eax\n    flds (%%esp)\n    addl $4,%%esp\n");
-                out("    fstps %d(%%ebp)\n",off);
-            } else if(vtype&&vtype->kind==TY_DOUBLE){
-                out("    pushl %%edx\n    pushl %%eax\n    fldl (%%esp)\n    addl $8,%%esp\n");
-                out("    fstpl %d(%%ebp)\n",off);
-            } else {
-                out("    movl %%eax,%d(%%ebp)\n",off);
-                if(vtype&&vtype->kind==TY_LONG)
-                    out("    movl %%edx,%d(%%ebp)\n",off+4);
-            }
+            /* int->float, float->double, double->float, ... into the declared type */
+            gen_convert32(n->left->etype,vtype);
+            out("    movl %%eax,%d(%%ebp)\n",off);
+            if(slot32(vtype)==8)out("    movl %%edx,%d(%%ebp)\n",off+4);
         }else{
             out("    movl $0,%d(%%ebp)\n",off);
-            if(vtype&&(vtype->kind==TY_LONG||vtype->kind==TY_DOUBLE))
+            if(slot32(vtype)==8)
                 out("    movl $0,%d(%%ebp)\n",off+4);
         }
         break;
     }
     case N_ASSIGN:{
+        /* `x op= y` was rewritten to `x = x op y` by the type checker */
         gen_expr(n->right);
-        if(strcmp(n->op,"=")==0){gen_store(n->left);}
-        else{
-            out("    pushl %%eax\n");gen_expr(n->left);out("    popl %%ecx\n");
-            if     (strcmp(n->op,"+=")==0)out("    addl %%ecx,%%eax\n");
-            else if(strcmp(n->op,"-=")==0)out("    subl %%ecx,%%eax\n");
-            else if(strcmp(n->op,"*=")==0)out("    imull %%ecx,%%eax\n");
-            else if(strcmp(n->op,"/=")==0){out("    pushl %%ecx\n    cdq\n    idivl (%%esp)\n    addl $4,%%esp\n");}
-            else if(strcmp(n->op,"%=")==0){out("    pushl %%ecx\n    cdq\n    idivl (%%esp)\n    addl $4,%%esp\n    movl %%edx,%%eax\n");}
-            else if(strcmp(n->op,"&=")==0)out("    andl %%ecx,%%eax\n");
-            else if(strcmp(n->op,"|=")==0)out("    orl  %%ecx,%%eax\n");
-            else if(strcmp(n->op,"^=")==0)out("    xorl %%ecx,%%eax\n");
-            else if(strcmp(n->op,"<<=")==0)out("    shll %%cl,%%eax\n");
-            else if(strcmp(n->op,">>=")==0)out("    sarl %%cl,%%eax\n");
-            gen_store(n->left);
-        }
+        gen_convert32(n->right->etype,n->left->etype);
+        gen_store(n->left);
         break;
     }
     case N_RETURN:
-        if(n->left)gen_expr(n->left);else out("    xorl %%eax,%%eax\n");
+        if(n->left){gen_expr(n->left);gen_convert32(n->left->etype,cur_ret_type);}
+        else out("    xorl %%eax,%%eax\n");
         out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n");
         out("    leave\n    ret\n");break;
     case N_EXPRSTMT:{
@@ -2270,11 +2715,16 @@ static void gen_stmt(Node *n){
 static void gen_func(Node *fn){
     nvars=0;frame_sz=0;/* lbl_cnt is global, not reset per function */
     memset(break_lbl,0,sizeof break_lbl);memset(cont_lbl,0,sizeof cont_lbl);
-    for(int i=0;i<fn->params.n;i++){
-        Var *v=&vars[nvars++];
-        v->name=xstrdup(fn->params.d[i].name);
-        v->offset=8+i*4;
-        v->type=fn->params.d[i].type;
+    cur_ret_type=fn->rettype;
+    {
+        int poff=8;
+        for(int i=0;i<fn->params.n;i++){
+            Var *v=&vars[nvars++];
+            v->name=xstrdup(fn->params.d[i].name);
+            v->offset=poff;
+            v->type=fn->params.d[i].type;
+            poff+=slot32(v->type);   /* long/double arguments occupy 8 bytes */
+        }
     }
     size_t body_start=out_len;
     for(int i=0;i<fn->body.n;i++)gen_stmt(fn->body.d[i]);
@@ -2406,70 +2856,76 @@ static void emit_runtime(void){
     out("    addl $8,%%esp\n");
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
 
-    /* _flr_print_double(lo:int, hi:int) — print a 64-bit double */
-    /* Uses integer arithmetic to avoid printf; prints up to 6 decimal places */
+    /* _flr_print_double(lo:int, hi:int) — print a 64-bit double with 6 decimals.
+       Rounds v*1e6 to a 64-bit integer FIRST and then splits it into
+       integer / fraction parts, so 2.9999999 prints "3.000000" (the old
+       code printed "2.000000": the fraction rounded up to 1000000 but the
+       carry never reached the integer part) and values >= 2^31 work (the old
+       code used a 32-bit fistpl). It also fixes the 16-bit `filds` that was
+       used to reload the integer part (anything >= 32768 printed garbage).
+       Values >= 9e12 skip the v*1e6 scaling (it would overflow int64): the
+       integer part and the fraction (via fprem) are converted separately; NaN / +-inf print as nan / inf. */
     out("_flr_print_double:\n");
     out("    pushl %%ebp\n    movl %%esp,%%ebp\n");
     out("    pushl %%esi\n    pushl %%edi\n    pushl %%ebx\n");
-    /* load double from args */
-    out("    fldl 8(%%ebp)\n");
-    /* check sign */
-    out("    fxam\n    fnstsw %%ax\n");
-    out("    testw $0x0200,%%ax\n    je .Lfpd_pos\n");
-    out("    fchs\n");
-    /* print minus */
+    out("    movl 12(%%ebp),%%eax\n    movl %%eax,%%ecx\n");
+    out("    shrl $20,%%ecx\n    andl $0x7ff,%%ecx\n    cmpl $0x7ff,%%ecx\n    je .Lfpd_special\n");
+    out("    testl %%eax,%%eax\n    jns .Lfpd_pos\n");
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_minus,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
     out(".Lfpd_pos:\n");
-    /* fistpl defaults to round-to-nearest, which is wrong for print (3.6
-       would print as "4...", not "3..."). Switch to truncate-toward-zero
-       for both integer-part extractions, then restore before the final
-       fractional-digit rounding below. */
-    out("    subl $4,%%esp\n    fnstcw (%%esp)\n    movw (%%esp),%%ax\n");
-    out("    orw $0x0C00,%%ax\n    movw %%ax,2(%%esp)\n    fldcw 2(%%esp)\n");
-    /* get integer part via fist */
-    out("    fld %%st(0)\n");
-    out("    subl $4,%%esp\n    fistpl (%%esp)\n    popl %%eax\n");
-    /* print integer part digits WITHOUT a trailing newline (can't reuse
-       _flr_print_int here — it always appends one, which would split
-       the number in the middle) */
-    out("    leal .Lflr_ibuf+11,%%edi\n");
-    out("    testl %%eax,%%eax\n    jge .Lfpd_int_pos\n    negl %%eax\n    movl $1,%%esi\n    jmp .Lfpd_int_l\n");
-    out(".Lfpd_int_pos:\n    xorl %%esi,%%esi\n");
-    out(".Lfpd_int_l:\n    movl $10,%%ecx\n    xorl %%edx,%%edx\n    divl %%ecx\n");
-    out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n");
-    out("    testl %%eax,%%eax\n    jne .Lfpd_int_l\n");
-    out("    testl %%esi,%%esi\n    je .Lfpd_int_nom\n    movb $45,(%%edi)\n    decl %%edi\n");
-    out(".Lfpd_int_nom:\n    incl %%edi\n");
-    out("    leal .Lflr_ibuf+12,%%edx\n    subl %%edi,%%edx\n    movl %%edi,%%ecx\n");
-    out("    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
-    /* print decimal point */
-    out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_dot,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
-    /* subtract integer part from float to get fraction (still truncate mode,
-       so this matches the integer part that was just printed) */
-    out("    fld %%st(0)\n");
-    out("    subl $4,%%esp\n    fistpl (%%esp)\n    filds (%%esp)\n    addl $4,%%esp\n");
-    out("    fsubrp\n");
-    /* restore original rounding mode for the fractional digits below */
-    out("    fldcw (%%esp)\n    addl $4,%%esp\n");
-    /* multiply fraction by 1000000, round to int, print 6 digits */
+    out("    fldl 8(%%ebp)\n    fabs\n");
+    out("    fldl .Lflr_big\n    fucomip %%st(1),%%st\n    jbe .Lfpd_big\n");
     out("    fldl .Lflr_1e6\n    fmulp\n");
-    out("    subl $4,%%esp\n    fistpl (%%esp)\n    popl %%eax\n");
-    out("    testl %%eax,%%eax\n    jge .Lfpd_fpos\n    negl %%eax\n");
-    out(".Lfpd_fpos:\n");
-    /* print 6-digit zero-padded fraction */
-    out("    leal .Lflr_ibuf+12,%%edi\n    movb $10,(%%edi)\n");
-    out("    movl $6,%%ecx\n");
-    out("    decl %%edi\n");
+    out("    subl $8,%%esp\n    fistpll (%%esp)\n    popl %%eax\n    popl %%edx\n");
+    out("    movl %%eax,%%ebx\n");
+    out("    movl %%edx,%%eax\n    xorl %%edx,%%edx\n    movl $1000000,%%ecx\n    divl %%ecx\n");
+    out("    movl %%eax,%%esi\n");
+    out("    movl %%ebx,%%eax\n    divl %%ecx\n");
+    out("    movl %%edx,%%edi\n    movl %%esi,%%edx\n    jmp .Lfpd_emit\n");
+    out(".Lfpd_big:\n");
+    /* fraction first: frac = fprem(|v|, 1.0), scaled by 1e6 and rounded -> edi */
+    out("    fld1\n    fldl 8(%%ebp)\n    fabs\n");
+    out(".Lfpd_bfp:\n    fprem\n    fnstsw %%ax\n    testb $4,%%ah\n    jnz .Lfpd_bfp\n    fstp %%st(1)\n");
+    out("    fldl .Lflr_1e6\n    fmulp\n    subl $4,%%esp\n    fistpl (%%esp)\n    popl %%edi\n");
+    out("    subl $16,%%esp\n    fnstcw 8(%%esp)\n    movzwl 8(%%esp),%%eax\n    orl $0x0c00,%%eax\n");
+    out("    movw %%ax,10(%%esp)\n    fldcw 10(%%esp)\n    fistpll (%%esp)\n    fldcw 8(%%esp)\n");
+    out("    movl (%%esp),%%eax\n    movl 4(%%esp),%%edx\n    addl $16,%%esp\n");
+    out("    testl %%edx,%%edx\n    jns .Lfpd_bok\n    movl $0xffffffff,%%eax\n    movl $0x7fffffff,%%edx\n    xorl %%edi,%%edi\n    jmp .Lfpd_emit\n");
+    /* fraction rounded up to 1.000000: carry into the integer part */
+    out(".Lfpd_bok:\n    cmpl $1000000,%%edi\n    jb .Lfpd_emit\n    xorl %%edi,%%edi\n    addl $1,%%eax\n    adcl $0,%%edx\n");
+    out(".Lfpd_emit:\n");
+    out("    call _flr_u64_nonl\n");
+    out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_dot,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
+    out("    movl %%edi,%%eax\n    leal .Lflr_ibuf+11,%%edi\n    movl $6,%%ecx\n");
     out(".Lfpd_fl:\n    movl $10,%%esi\n    xorl %%edx,%%edx\n    divl %%esi\n");
-    out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n");
-    out("    loop .Lfpd_fl\n");
-    out("    incl %%edi\n");
-    out("    movl $6,%%edx\n    movl %%edi,%%ecx\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n    loop .Lfpd_fl\n");
+    out("    incl %%edi\n    movl $6,%%edx\n    movl %%edi,%%ecx\n");
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
-    /* newline */
     out("    movl $4,%%eax\n    movl $1,%%ebx\n    leal .Lflr_nl,%%ecx\n    movl $1,%%edx\n    int $0x80\n");
+    out("    jmp .Lfpd_ret\n");
+    out(".Lfpd_special:\n");
+    out("    movl 12(%%ebp),%%eax\n    andl $0x000fffff,%%eax\n    orl 8(%%ebp),%%eax\n    jne .Lfpd_nan\n");
+    out("    cmpl $0,12(%%ebp)\n    jl .Lfpd_ninf\n");
+    out("    leal .Lflr_inf,%%ecx\n    movl $4,%%edx\n    jmp .Lfpd_sp_w\n");
+    out(".Lfpd_ninf:\n    leal .Lflr_ninf,%%ecx\n    movl $5,%%edx\n    jmp .Lfpd_sp_w\n");
+    out(".Lfpd_nan:\n    leal .Lflr_nan,%%ecx\n    movl $4,%%edx\n");
+    out(".Lfpd_sp_w:\n    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
+    out(".Lfpd_ret:\n");
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
 
+    /* _flr_u64_nonl: print edx:eax as an unsigned decimal, no newline.
+       Preserves esi/edi/ebx. */
+    out("_flr_u64_nonl:\n");
+    out("    pushl %%esi\n    pushl %%edi\n    pushl %%ebx\n");
+    out("    movl %%edx,%%ebx\n    movl %%eax,%%esi\n    leal .Lflr_ibuf+31,%%edi\n");
+    out(".Lu64_l:\n    movl $10,%%ecx\n");
+    out("    movl %%ebx,%%eax\n    xorl %%edx,%%edx\n    divl %%ecx\n    movl %%eax,%%ebx\n");
+    out("    movl %%esi,%%eax\n    divl %%ecx\n    movl %%eax,%%esi\n");
+    out("    addb $48,%%dl\n    movb %%dl,(%%edi)\n    decl %%edi\n");
+    out("    movl %%ebx,%%eax\n    orl %%esi,%%eax\n    jne .Lu64_l\n");
+    out("    leal .Lflr_ibuf+31,%%edx\n    subl %%edi,%%edx\n    incl %%edi\n    movl %%edi,%%ecx\n");
+    out("    movl $4,%%eax\n    movl $1,%%ebx\n    int $0x80\n");
+    out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    ret\n\n");
 
     /* strlen / str_len */
     out("_flr_strlen:\n    movl 4(%%esp),%%ecx\n    movl %%ecx,%%eax\n");
@@ -2646,42 +3102,76 @@ static void emit_runtime(void){
 static void gen_expr64(Node *n);
 static void gen_stmt64(Node *n);
 
+/* ── x86-64 value representation ─────────────────────────────────────
+   every int/long/bool/ptr/str/struct value : rax
+   float / double                           : xmm0 (single / double precision) */
+static TypeRef *ty_dbl64(void){static TypeRef *t;if(!t)t=mktype(TY_DOUBLE,NULL,NULL);return t;}
+static TypeRef *ty_flt64(void){static TypeRef *t;if(!t)t=mktype(TY_FLOAT,NULL,NULL);return t;}
+static int kcls64(TypeRef *t){int k=kcls(t);return k==K_L?K_I:k;}
+
+static void gen_convert64(TypeRef *from,TypeRef *to){
+    int f=kcls64(from),t=kcls64(to);
+    if(f==t)return;
+    if(f==K_I){out(t==K_F?"    cvtsi2ssq %%rax,%%xmm0\n":"    cvtsi2sdq %%rax,%%xmm0\n");return;}
+    if(t==K_I){out(f==K_F?"    cvttss2si %%xmm0,%%rax\n":"    cvttsd2si %%xmm0,%%rax\n");return;}
+    if(f==K_F)out("    cvtss2sd %%xmm0,%%xmm0\n");   /* float -> double */
+    else      out("    cvtsd2ss %%xmm0,%%xmm0\n");   /* double -> float */
+}
+/* push the current value (rax or xmm0) as one 8-byte stack slot */
+static void spill64(TypeRef *t){
+    int k=kcls64(t);
+    if(k==K_F)      out("    subq $8,%%rsp\n    movss %%xmm0,(%%rsp)\n");
+    else if(k==K_D) out("    subq $8,%%rsp\n    movsd %%xmm0,(%%rsp)\n");
+    else            out("    pushq %%rax\n");
+}
+/* load a value of type t from memory operand `mem` into rax / xmm0 */
+static void load64(TypeRef *t,const char *mem){
+    int k=kcls64(t);
+    if(k==K_F)      out("    movss %s,%%xmm0\n",mem);
+    else if(k==K_D) out("    movsd %s,%%xmm0\n",mem);
+    else            out("    movq %s,%%rax\n",mem);
+}
+/* store rax / xmm0 (already of type t) to memory operand `mem` */
+static void store64(TypeRef *t,const char *mem){
+    int k=kcls64(t);
+    if(k==K_F)      out("    movss %%xmm0,%s\n",mem);
+    else if(k==K_D) out("    movsd %%xmm0,%s\n",mem);
+    else            out("    movq %%rax,%s\n",mem);
+}
+
 static void gen_store64(Node *lv){
+    /* value to store is in rax / xmm0, already converted to the lvalue's type */
+    char mem[96];
     switch(lv->kind){
     case N_IDENT:{
         Var *v=find_var(lv->name);
         if(!v)die("%s:%d: undefined variable '%s'",lv->file,lv->line,lv->name);
         int gidx=(v->offset<=-999999)?(-999999-v->offset):-1;
-        if(gidx>=0){
-            if(v->type&&(v->type->kind==TY_FLOAT))
-                out("    movss %%xmm0,_gv_%s(%%rip)\n",gvars[gidx].name);
-            else if(v->type&&(v->type->kind==TY_DOUBLE))
-                out("    movsd %%xmm0,_gv_%s(%%rip)\n",gvars[gidx].name);
-            else
-                out("    movq %%rax,_gv_%s(%%rip)\n",gvars[gidx].name);
-            break;
-        }
-        if(v->type&&(v->type->kind==TY_FLOAT)){
-            out("    movss %%xmm0,%d(%%rbp)\n",v->offset);
-        } else if(v->type&&(v->type->kind==TY_DOUBLE)){
-            out("    movsd %%xmm0,%d(%%rbp)\n",v->offset);
-        } else {
-            out("    movq %%rax,%d(%%rbp)\n",v->offset);
-        }
+        if(gidx>=0)snprintf(mem,sizeof mem,"_gv_%s(%%rip)",gvars[gidx].name);
+        else       snprintf(mem,sizeof mem,"%d(%%rbp)",v->offset);
+        store64(v->type,mem);
         break;
     }
     case N_INDEX:
-        out("    pushq %%rax\n");
+        spill64(lv->etype);
         gen_expr64(lv->right); out("    pushq %%rax\n");
         gen_expr64(lv->left);  out("    popq %%rcx\n");
         /* array layout: [count:8][count:8][elem0][elem1]...  elements at base+16 */
         out("    leaq 16(%%rax,%%rcx,8),%%rdx\n");
-        out("    popq %%rax\n    movq %%rax,(%%rdx)\n");
+        if(kcls64(lv->etype)==K_I)out("    movq (%%rsp),%%rax\n");
+        else load64(lv->etype,"(%rsp)");
+        out("    addq $8,%%rsp\n");
+        store64(lv->etype,"(%rdx)");
         break;
     case N_FIELD:{
-        out("    pushq %%rax\n"); gen_expr64(lv->left);
+        spill64(lv->etype);
+        gen_expr64(lv->left);
         int found_off=field_offset(lv->left,lv->sval,8);
-        out("    popq %%rcx\n    movq %%rcx,%d(%%rax)\n",found_off);
+        out("    movq %%rax,%%rdx\n");
+        load64(lv->etype,"(%rsp)");
+        out("    addq $8,%%rsp\n");
+        snprintf(mem,sizeof mem,"%d(%%rdx)",found_off);
+        store64(lv->etype,mem);
         break;
     }
     default:die("gen_store64: not an lvalue");
@@ -2804,6 +3294,20 @@ static void gen_expr64(Node *n){
     }
     case N_BINOP:{
         const char *op=n->op;
+        /* short-circuit `and` / `or` (see the x86-32 backend) */
+        if(strcmp(op,"and")==0||strcmp(op,"or")==0){
+            int is_and=(op[0]=='a');
+            int Lsc=new_label();
+            gen_expr64(n->left);
+            out("    testq %%rax,%%rax\n");
+            out(is_and?"    jz .Lscs%d\n":"    jnz .Lscs%d\n",Lsc);
+            gen_expr64(n->right);
+            out("    testq %%rax,%%rax\n");
+            out(is_and?"    jz .Lscs%d\n":"    jnz .Lscs%d\n",Lsc);
+            out("    movl $%d,%%eax\n    jmp .Lsce%d\n",is_and?1:0,Lsc);
+            out(".Lscs%d:\n    movl $%d,%%eax\n.Lsce%d:\n",Lsc,is_and?0:1,Lsc);
+            break;
+        }
         int lf=(n->left&&n->left->etype&&(n->left->etype->kind==TY_FLOAT||n->left->etype->kind==TY_DOUBLE));
         int rf=(n->right&&n->right->etype&&(n->right->etype->kind==TY_FLOAT||n->right->etype->kind==TY_DOUBLE));
         int use_dbl=(n->etype&&n->etype->kind==TY_DOUBLE)||
@@ -2812,80 +3316,61 @@ static void gen_expr64(Node *n){
 
         /* str + str → str_concat */
         if(strcmp(op,"+")==0&&n->left->etype&&n->left->etype->kind==TY_STR){
-            gen_expr64(n->right); out("    pushq %%rax\n");
-            gen_expr64(n->left);
-            out("    movq %%rax,%%rdi\n    popq %%rsi\n");
+            gen_expr64(n->left); out("    pushq %%rax\n");
+            gen_expr64(n->right);
+            out("    movq %%rax,%%rsi\n    popq %%rdi\n");
             out("    call _flr_str_concat\n");
             break;
         }
 
-        /* float/double via SSE2 */
+        /* float/double via SSE.  The right operand is spilled to the stack
+           while the left is evaluated: the old code parked it in xmm1, which
+           any nested float expression on the left (`a*b + c*d`) clobbered. */
         if(lf||rf){
+            int d=use_dbl;
             int is_cmp=(!strcmp(op,"==")||!strcmp(op,"!=")||!strcmp(op,"<")||!strcmp(op,">")||!strcmp(op,"<=")||!strcmp(op,">="));
-            /* evaluate rhs into xmm1, lhs into xmm0 */
-            gen_expr64(n->right);
-            if(use_dbl){
-                if(rf&&n->right->etype&&n->right->etype->kind==TY_DOUBLE)
-                    out("    movsd %%xmm0,%%xmm1\n");
-                else if(rf)
-                    out("    cvtss2sd %%xmm0,%%xmm1\n");
-                else
-                    out("    cvtsi2sdq %%rax,%%xmm1\n");
-            } else {
-                if(rf&&n->right->etype&&n->right->etype->kind==TY_FLOAT)
-                    out("    movss %%xmm0,%%xmm1\n");
-                else if(rf)
-                    out("    cvtsd2ss %%xmm0,%%xmm1\n");
-                else
-                    out("    cvtsi2ssl %%eax,%%xmm1\n");
-            }
-            gen_expr64(n->left);
-            if(use_dbl){
-                if(lf&&n->left->etype&&n->left->etype->kind==TY_DOUBLE)
-                    {}/* already in xmm0 */
-                else if(lf)
-                    out("    cvtss2sd %%xmm0,%%xmm0\n");
-                else
-                    out("    cvtsi2sdq %%rax,%%xmm0\n");
-            } else {
-                if(lf&&n->left->etype&&n->left->etype->kind==TY_FLOAT)
-                    {}/* already in xmm0 */
-                else if(lf)
-                    out("    cvtsd2ss %%xmm0,%%xmm0\n");
-                else
-                    out("    cvtsi2ssl %%eax,%%xmm0\n");
-            }
+            TypeRef *CT=d?ty_dbl64():ty_flt64();
+            gen_expr64(n->left);gen_convert64(n->left->etype,CT);
+            out(d?"    subq $8,%%rsp\n    movsd %%xmm0,(%%rsp)\n":"    subq $8,%%rsp\n    movss %%xmm0,(%%rsp)\n");
+            gen_expr64(n->right);gen_convert64(n->right->etype,CT);
+            out("    movaps %%xmm0,%%xmm1\n");
+            out(d?"    movsd (%%rsp),%%xmm0\n":"    movss (%%rsp),%%xmm0\n");
+            out("    addq $8,%%rsp\n");               /* xmm0 = left, xmm1 = right */
             if(is_cmp){
-                if(use_dbl) out("    ucomisd %%xmm1,%%xmm0\n");
-                else        out("    ucomiss %%xmm1,%%xmm0\n");
-                if(!strcmp(op,"=="))     out("    sete %%al\n");
-                else if(!strcmp(op,"!="))out("    setne %%al\n");
-                else if(!strcmp(op,"<")) out("    setb %%al\n");
-                else if(!strcmp(op,">")) out("    seta %%al\n");
-                else if(!strcmp(op,"<="))out("    setbe %%al\n");
-                else if(!strcmp(op,">="))out("    setae %%al\n");
+                /* ucomis* sets CF/ZF/PF; unordered (NaN) sets all three. `<` and
+                   `<=` are evaluated as the swapped `>` / `>=` so NaN yields
+                   false; == and != also consult PF. */
+                int swap=(!strcmp(op,"<")||!strcmp(op,"<="));
+                if(!swap)out(d?"    ucomisd %%xmm1,%%xmm0\n":"    ucomiss %%xmm1,%%xmm0\n");
+                else     out(d?"    ucomisd %%xmm0,%%xmm1\n":"    ucomiss %%xmm0,%%xmm1\n");
+                if     (!strcmp(op,"==")) out("    sete %%al\n    setnp %%cl\n    andb %%cl,%%al\n");
+                else if(!strcmp(op,"!=")) out("    setne %%al\n    setp %%cl\n    orb %%cl,%%al\n");
+                else if(!strcmp(op,"<")||!strcmp(op,">")) out("    seta %%al\n");
+                else                                      out("    setae %%al\n");
                 out("    movzbq %%al,%%rax\n");
             } else {
-                if(use_dbl){
-                    if(!strcmp(op,"+"))     out("    addsd %%xmm1,%%xmm0\n");
-                    else if(!strcmp(op,"-"))out("    subsd %%xmm1,%%xmm0\n");  /* xmm0 = xmm0 - xmm1 */
-                    else if(!strcmp(op,"*"))out("    mulsd %%xmm1,%%xmm0\n");
-                    else if(!strcmp(op,"/"))out("    divsd %%xmm1,%%xmm0\n");
-                    else die("unsupported double op '%s'",op);
-                } else {
-                    if(!strcmp(op,"+"))     out("    addss %%xmm1,%%xmm0\n");
-                    else if(!strcmp(op,"-"))out("    subss %%xmm1,%%xmm0\n");
-                    else if(!strcmp(op,"*"))out("    mulss %%xmm1,%%xmm0\n");
-                    else if(!strcmp(op,"/"))out("    divss %%xmm1,%%xmm0\n");
-                    else die("unsupported float op '%s'",op);
+                const char *sx=d?"sd":"ss";
+                if     (!strcmp(op,"+"))out("    add%s %%xmm1,%%xmm0\n",sx);
+                else if(!strcmp(op,"-"))out("    sub%s %%xmm1,%%xmm0\n",sx);
+                else if(!strcmp(op,"*"))out("    mul%s %%xmm1,%%xmm0\n",sx);
+                else if(!strcmp(op,"/"))out("    div%s %%xmm1,%%xmm0\n",sx);
+                else if(!strcmp(op,"%")){
+                    /* fmod via x87 fprem (no libm): st0=left, st1=right */
+                    int L=new_label();
+                    out("    subq $16,%%rsp\n    mov%s %%xmm1,(%%rsp)\n    mov%s %%xmm0,8(%%rsp)\n",sx,sx);
+                    out(d?"    fldl (%%rsp)\n    fldl 8(%%rsp)\n":"    flds (%%rsp)\n    flds 8(%%rsp)\n");
+                    out(".Lfmod%d:\n    fprem\n    fnstsw %%ax\n    testb $4,%%ah\n    jnz .Lfmod%d\n    fstp %%st(1)\n",L,L);
+                    out(d?"    fstpl 8(%%rsp)\n":"    fstps 8(%%rsp)\n");
+                    out("    mov%s 8(%%rsp),%%xmm0\n    addq $16,%%rsp\n",sx);
                 }
+                else die("%s:%d: operator '%s' is not defined for float/double",n->file,n->line,op);
             }
             break;
         }
 
         /* integer / long / bool — all native 64-bit */
-        gen_expr64(n->right); out("    pushq %%rax\n");
-        gen_expr64(n->left);  out("    popq %%rcx\n");
+        gen_expr64(n->left);  out("    pushq %%rax\n");
+        gen_expr64(n->right); out("    movq %%rax,%%rcx\n    popq %%rax\n");
         if     (!strcmp(op,"+"))  out("    addq %%rcx,%%rax\n");
         else if(!strcmp(op,"-"))  out("    subq %%rcx,%%rax\n");
         else if(!strcmp(op,"*"))  out("    imulq %%rcx,%%rax\n");
@@ -2916,12 +3401,11 @@ static void gen_expr64(Node *n){
     case N_UNOP:
         gen_expr64(n->left);
         if(!strcmp(n->op,"-")&&n->etype&&n->etype->kind==TY_FLOAT){
-            /* float lives in xmm0; there's no direct SSE negate, so
-               compute 0.0 - xmm0 via a scratch register */
-            out("    pxor %%xmm1,%%xmm1\n    subss %%xmm0,%%xmm1\n    movaps %%xmm1,%%xmm0\n");
+            /* flip the sign bit: 0.0 - x would turn -(0.0) into +0.0 */
+            out("    movd %%xmm0,%%eax\n    btcl $31,%%eax\n    movd %%eax,%%xmm0\n");
         }
         else if(!strcmp(n->op,"-")&&n->etype&&n->etype->kind==TY_DOUBLE){
-            out("    pxor %%xmm1,%%xmm1\n    subsd %%xmm0,%%xmm1\n    movapd %%xmm1,%%xmm0\n");
+            out("    movq %%xmm0,%%rax\n    btcq $63,%%rax\n    movq %%rax,%%xmm0\n");
         }
         else if     (!strcmp(n->op,"-"))  out("    negq %%rax\n");
         else if(!strcmp(n->op,"~"))  out("    notq %%rax\n");
@@ -2976,45 +3460,63 @@ static void gen_expr64(Node *n){
             break;
         }
 
-        /* general call: push args r-to-l, load first 6 into regs */
-        for(int i=nargs-1;i>=0;i--){
-            gen_expr64(n->args.d[i]);
-            /* float/double: save xmm0 to stack slot */
-            int is_fp=(n->args.d[i]->etype&&
-                      (n->args.d[i]->etype->kind==TY_FLOAT||
-                       n->args.d[i]->etype->kind==TY_DOUBLE));
-            if(is_fp) out("    subq $8,%%rsp\n    movsd %%xmm0,(%%rsp)\n");
-            else       out("    pushq %%rax\n");
-        }
-        /* load up to 6 integer args into registers */
-        int ireg=0;
-        for(int i=0;i<nargs&&ireg<6;i++){
-            int is_fp=(n->args.d[i]->etype&&
-                      (n->args.d[i]->etype->kind==TY_FLOAT||
-                       n->args.d[i]->etype->kind==TY_DOUBLE));
-            if(!is_fp){
-                out("    popq %%%s\n",argregs64[ireg++]);
+        /* general call, System V AMD64: integer-class args go in
+           rdi,rsi,rdx,rcx,r8,r9, float/double args in xmm0..xmm7 (counted
+           separately), anything beyond that on the stack. Each argument is
+           converted to the callee's declared parameter type first. */
+        {
+            FuncSig *sig=find_func(n->callee);
+            int *where=calloc(nargs+1,sizeof(int));   /* >=100: xmm(where-100), 0..5: int reg, -1: stack */
+            TypeRef **pts=calloc(nargs+1,sizeof(TypeRef*));
+            int ni=0,nf=0,ns=0;
+            for(int i=0;i<nargs;i++){
+                Node *a=n->args.d[i];
+                pts[i]=(sig&&i<sig->params.n)?sig->params.d[i].type:a->etype;
+                if(kcls64(pts[i])==K_I){ if(ni<6)where[i]=ni++; else {where[i]=-1;ns++;} }
+                else                   { if(nf<8)where[i]=100+nf++; else {where[i]=-1;ns++;} }
             }
-            /* fp args stay on stack for now (simple approach) */
+            /* evaluate right-to-left into 8-byte temp slots: arg i ends up at 8*i(%rsp) */
+            for(int i=nargs-1;i>=0;i--){
+                gen_expr64(n->args.d[i]);
+                gen_convert64(n->args.d[i]->etype,pts[i]);
+                spill64(pts[i]);
+            }
+            for(int i=0;i<nargs;i++){
+                char mem[32];snprintf(mem,sizeof mem,"%d(%%rsp)",8*i);
+                if(where[i]>=100){
+                    out(kcls64(pts[i])==K_D?"    movsd %s,%%xmm%d\n":"    movss %s,%%xmm%d\n",mem,where[i]-100);
+                }else if(where[i]>=0){
+                    out("    movq %s,%%%s\n",mem,argregs64[where[i]]);
+                }
+            }
+            if(ns>0){
+                /* copy the overflow args, in order, to the very top of the stack */
+                out("    subq $%d,%%rsp\n",8*ns);
+                int k=0;
+                for(int i=0;i<nargs;i++)if(where[i]==-1){
+                    out("    movq %d(%%rsp),%%rax\n    movq %%rax,%d(%%rsp)\n",8*ns+8*i,8*k);k++;
+                }
+            }
+            out("    movl $%d,%%eax\n",nf);        /* al = number of vector registers used */
+            out("    call %s\n",n->callee);
+            if(nargs+ns>0)out("    addq $%d,%%rsp\n",8*(nargs+ns));
+            free(where);free(pts);
         }
-        out("    xorl %%eax,%%eax\n"); /* al=0: no xmm args (conservative) */
-        out("    call %s\n",n->callee);
-        /* clean up any remaining stack args */
-        int rem=nargs-ireg;
-        if(rem>0) out("    addq $%d,%%rsp\n",rem*8);
         break;
     }
     case N_INDEX:
         gen_expr64(n->right); out("    pushq %%rax\n");
         gen_expr64(n->left);  out("    popq %%rcx\n");
         out("    leaq 16(%%rax,%%rcx,8),%%rax\n");
-        out("    movq (%%rax),%%rax\n"); break;
+        load64(n->etype,"(%rax)"); break;
     case N_FIELD:{
         gen_expr64(n->left);
         int found_off=field_offset(n->left,n->sval,8);
-        out("    movq %d(%%rax),%%rax\n",found_off); break;
+        char mem[48];snprintf(mem,sizeof mem,"%d(%%rax)",found_off);
+        load64(n->etype,mem); break;
     }
     case N_ARRAYLIT:{
+        TypeRef *elt=(n->etype&&n->etype->kind==TY_ARRAY&&n->etype->elem)?n->etype->elem:NULL;
         int cnt=n->elems.n;
         long long alloc_sz=16+(long long)cnt*8;
         out("    movq $%lld,%%rdi\n",alloc_sz);
@@ -3022,9 +3524,12 @@ static void gen_expr64(Node *n){
         out("    pushq %%rax\n");
         out("    movq $%d,(%%rax)\n    movq $%d,8(%%rax)\n",cnt,cnt);
         for(int i=0;i<cnt;i++){
-            out("    movq (%%rsp),%%rdi\n");
             gen_expr64(n->elems.d[i]);
-            out("    movq %%rax,%d(%%rdi)\n",(int)(16+i*8));
+            gen_convert64(n->elems.d[i]->etype,elt);
+            /* reload the base AFTER evaluating the element (it may clobber rdi) */
+            out("    movq (%%rsp),%%rdi\n");
+            char mem[48];snprintf(mem,sizeof mem,"%d(%%rdi)",(int)(16+i*8));
+            store64(elt,mem);
         }
         out("    popq %%rax\n"); break;
     }
@@ -3056,54 +3561,28 @@ static void gen_stmt64(Node *n){
         int off=alloc_var(n->name,vtype);
         if(n->left){
             gen_expr64(n->left);
-            if(vtype&&vtype->kind==TY_FLOAT)
-                out("    movss %%xmm0,%d(%%rbp)\n",off);
-            else if(vtype&&vtype->kind==TY_DOUBLE)
-                out("    movsd %%xmm0,%d(%%rbp)\n",off);
-            else
-                out("    movq %%rax,%d(%%rbp)\n",off);
+            gen_convert64(n->left->etype,vtype);   /* int->double, double->float, ... */
+            char mem[48];snprintf(mem,sizeof mem,"%d(%%rbp)",off);
+            store64(vtype,mem);
         } else {
             out("    movq $0,%d(%%rbp)\n",off);
         }
         break;
     }
     case N_ASSIGN:{
+        /* `x op= y` was rewritten to `x = x op y` by the type checker */
         gen_expr64(n->right);
-        if(strcmp(n->op,"=")==0){gen_store64(n->left);}
-        else{
-            /* compound: load lhs into rcx/xmm1, operate, store */
-            int is_fp=(n->left->etype&&(n->left->etype->kind==TY_FLOAT||n->left->etype->kind==TY_DOUBLE));
-            if(is_fp){
-                /* save rhs xmm0 -> xmm1, load lhs -> xmm0, operate */
-                int dbl=(n->left->etype->kind==TY_DOUBLE);
-                if(dbl) out("    movsd %%xmm0,%%xmm1\n"); else out("    movss %%xmm0,%%xmm1\n");
-                gen_expr64(n->left);
-                if(!strcmp(n->op,"+=")){ if(dbl)out("    addsd %%xmm1,%%xmm0\n");else out("    addss %%xmm1,%%xmm0\n");}
-                else if(!strcmp(n->op,"-=")){ if(dbl)out("    subsd %%xmm1,%%xmm0\n");else out("    subss %%xmm1,%%xmm0\n");}
-                else if(!strcmp(n->op,"*=")){ if(dbl)out("    mulsd %%xmm1,%%xmm0\n");else out("    mulss %%xmm1,%%xmm0\n");}
-                else if(!strcmp(n->op,"/=")){ if(dbl)out("    divsd %%xmm1,%%xmm0\n");else out("    divss %%xmm1,%%xmm0\n");}
-                gen_store64(n->left);
-            } else {
-                out("    pushq %%rax\n"); gen_expr64(n->left); out("    popq %%rcx\n");
-                if     (!strcmp(n->op,"+="))  out("    addq %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"-="))  out("    subq %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"*="))  out("    imulq %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"/="))  {out("    pushq %%rcx\n    cqto\n    idivq (%%rsp)\n    addq $8,%%rsp\n");}
-                else if(!strcmp(n->op,"%="))  {out("    pushq %%rcx\n    cqto\n    idivq (%%rsp)\n    addq $8,%%rsp\n    movq %%rdx,%%rax\n");}
-                else if(!strcmp(n->op,"&="))  out("    andq %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"|="))  out("    orq  %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"^="))  out("    xorq %%rcx,%%rax\n");
-                else if(!strcmp(n->op,"<<=")) out("    shlq %%cl,%%rax\n");
-                else if(!strcmp(n->op,">>=")) out("    sarq %%cl,%%rax\n");
-                gen_store64(n->left);
-            }
-        }
+        gen_convert64(n->right->etype,n->left->etype);
+        gen_store64(n->left);
         break;
     }
     case N_RETURN:
-        if(n->left) gen_expr64(n->left);
+        if(n->left){gen_expr64(n->left);gen_convert64(n->left->etype,cur_ret_type);}
         else out("    xorl %%eax,%%eax\n");
-        out("    addq $%d,%%rsp\n",((frame_sz+15)&~15)); /* dealloc locals */
+        /* The callee-saved registers were pushed AFTER the locals were
+           allocated, so they are popped straight off rsp. The old code added
+           the frame size back first, which made these pops read local-variable
+           slots instead — a `return` clobbered the caller's rbx/r13-r15. */
         out("    popq %%r15\n    popq %%r14\n    popq %%r13\n");
         out("    popq %%rbx\n");
         out("    leave\n    ret\n");
@@ -3133,15 +3612,15 @@ static void gen_stmt64(Node *n){
     case N_IF:{
         int lend=new_label(),lnext=new_label();
         gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lif%d\n",lnext);
-        for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
+        {int sv=nvars;for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);nvars=sv;}
         out("    jmp .Lif%d\n.Lif%d:\n",lend,lnext);
         for(int ei=0;ei<n->elifs.n;ei++){
             ElifClause *ec=&n->elifs.d[ei];int ln2=new_label();
             gen_expr64(ec->cond);out("    testq %%rax,%%rax\n    je .Lif%d\n",ln2);
-            for(int i=0;i<ec->body.n;i++)gen_stmt64(ec->body.d[i]);
+            {int sv=nvars;for(int i=0;i<ec->body.n;i++)gen_stmt64(ec->body.d[i]);nvars=sv;}
             out("    jmp .Lif%d\n.Lif%d:\n",lend,ln2);
         }
-        for(int i=0;i<n->else_body.n;i++)gen_stmt64(n->else_body.d[i]);
+        {int sv=nvars;for(int i=0;i<n->else_body.n;i++)gen_stmt64(n->else_body.d[i]);nvars=sv;}
         out(".Lif%d:\n",lend); break;
     }
     case N_WHILE:{
@@ -3149,7 +3628,7 @@ static void gen_stmt64(Node *n){
         char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
         snprintf(break_lbl,64,".Lwh%d",le);snprintf(cont_lbl,64,".Lwh%d",ls);
         out(".Lwh%d:\n",ls);gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lwh%d\n",le);
-        for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
+        {int sv=nvars;for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);nvars=sv;}
         out("    jmp .Lwh%d\n.Lwh%d:\n",ls,le);
         strcpy(break_lbl,ob);strcpy(cont_lbl,oc); break;
     }
@@ -3157,11 +3636,13 @@ static void gen_stmt64(Node *n){
         int ls=new_label(),le=new_label(),lp=new_label();
         char ob[64],oc[64];strcpy(ob,break_lbl);strcpy(oc,cont_lbl);
         snprintf(break_lbl,64,".Lfor%d",le);snprintf(cont_lbl,64,".Lfor%d",lp);
+        int sv=nvars;
         gen_stmt64(n->for_init);
         out(".Lfor%d:\n",ls);gen_expr64(n->cond);out("    testq %%rax,%%rax\n    je .Lfor%d\n",le);
         for(int i=0;i<n->body.n;i++)gen_stmt64(n->body.d[i]);
         out(".Lfor%d:\n",lp);gen_stmt64(n->for_post);
         out("    jmp .Lfor%d\n.Lfor%d:\n",ls,le);
+        nvars=sv;
         strcpy(break_lbl,ob);strcpy(cont_lbl,oc); break;
     }
     case N_BREAK:
@@ -3178,36 +3659,35 @@ static void gen_func64(Node *fn){
     nvars=0;frame_sz=0;
     memset(break_lbl,0,sizeof break_lbl);memset(cont_lbl,0,sizeof cont_lbl);
 
-    /* parameters: first 6 ints via registers, rest on stack above rbp+16 */
-    /* we store all params as locals for simplicity */
-    /* allocate slots for params */
+    /* parameters (System V AMD64): integer-class args arrive in
+       rdi,rsi,rdx,rcx,r8,r9 and float/double args in xmm0..xmm7 — each class
+       is counted separately — everything else is on the stack above rbp+16. */
+    cur_ret_type=fn->rettype;
     for(int i=0;i<fn->params.n;i++){
         int off=alloc_var(fn->params.d[i].name,fn->params.d[i].type);
         (void)off;
     }
 
-    /* generate body into temp buffer */
+    /* generate body into temp buffer; param spills go first, inside it */
     size_t body_start=out_len;
-    /* emit param loads INSIDE the body buffer (after prologue sets up frame) */
-    /* we'll emit them first, then the actual stmts */
-    for(int i=0;i<fn->params.n;i++){
-        Var *v=&vars[i]; /* params are allocated first */
-        if(i<6){
-            int is_fp=(v->type&&(v->type->kind==TY_FLOAT||v->type->kind==TY_DOUBLE));
-            if(is_fp){
-                /* xmm args: xmm0..xmm7 */
-                if(v->type->kind==TY_DOUBLE)
-                    out("    movsd %%xmm%d,%d(%%rbp)\n",i,v->offset);
-                else
-                    out("    movss %%xmm%d,%d(%%rbp)\n",i,v->offset);
-            } else {
-                out("    movq %%%s,%d(%%rbp)\n",argregs64[i],v->offset);
+    {
+        int ni=0,nf=0,nstack=0;
+        for(int i=0;i<fn->params.n;i++){
+            Var *v=&vars[i]; /* params are allocated first */
+            char mem[48];snprintf(mem,sizeof mem,"%d(%%rbp)",v->offset);
+            int k=kcls64(v->type);
+            if(k==K_I){
+                if(ni<6)out("    movq %%%s,%s\n",argregs64[ni++],mem);
+                else{
+                    out("    movq %d(%%rbp),%%rax\n    movq %%rax,%s\n",16+8*nstack++,mem);
+                }
+            }else{
+                if(nf<8){
+                    out(k==K_D?"    movsd %%xmm%d,%s\n":"    movss %%xmm%d,%s\n",nf++,mem);
+                }else{
+                    out("    movq %d(%%rbp),%%rax\n    movq %%rax,%s\n",16+8*nstack++,mem);
+                }
             }
-        } else {
-            /* extra params are at rbp+16, rbp+24, ... */
-            int stack_off=16+(i-6)*8;
-            out("    movq %d(%%rbp),%%rax\n",stack_off);
-            out("    movq %%rax,%d(%%rbp)\n",v->offset);
         }
     }
     for(int i=0;i<fn->body.n;i++)gen_stmt64(fn->body.d[i]);
@@ -3337,43 +3817,47 @@ static void emit_runtime64(void){
     out("    cvtss2sd %%xmm0,%%xmm0\n");
     out("    call _flr_print_double\n    ret\n\n");
 
-    /* print_double(val in xmm0) — integer digits + 6 decimal places */
+    /* print_double(val in xmm0) — integer digits + 6 decimal places.
+       Same scheme as the 32-bit version: round v*1e6 to an integer first,
+       then split by 1e6, so a fraction that rounds up carries into the
+       integer part (2.9999999 -> "3.000000", not "2.000000"). Values >= 9e12
+       skip the scaling; NaN / +-inf print as nan / inf. */
     out("_flr_print_double:\n");
     out("    pushq %%rbx\n    pushq %%r12\n    pushq %%r13\n    pushq %%r14\n");
-    /* check sign via movq xmm0->rax, test high bit */
-    out("    movq %%xmm0,%%rax\n");
+    out("    movq %%xmm0,%%rax\n    movq %%rax,%%rcx\n    shrq $52,%%rcx\n    andl $0x7ff,%%ecx\n");
+    out("    cmpl $0x7ff,%%ecx\n    je .Lfpd64_special\n");
     out("    testq %%rax,%%rax\n    jns .Lfpd64_pos\n");
-    /* negative: flip sign bit, print '-' */
-    out("    movabsq $0x8000000000000000,%%rcx\n    xorq %%rcx,%%rax\n    movq %%rax,%%xmm0\n");
+    out("    btrq $63,%%rax\n    movq %%rax,%%xmm0\n");
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_minus(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
     out(".Lfpd64_pos:\n");
-    /* extract integer part */
-    out("    cvttsd2si %%xmm0,%%rdi\n    call _flr_print_int_nonl\n");
-    /* decimal point */
+    out("    movsd .Lflr_big(%%rip),%%xmm1\n    ucomisd %%xmm1,%%xmm0\n    jae .Lfpd64_big\n");
+    out("    mulsd .Lflr_1e6(%%rip),%%xmm0\n    cvtsd2si %%xmm0,%%rax\n");
+    out("    xorl %%edx,%%edx\n    movq $1000000,%%rcx\n    divq %%rcx\n");
+    out("    movq %%rdx,%%r14\n    movq %%rax,%%rdi\n    jmp .Lfpd64_emit\n");
+    out(".Lfpd64_big:\n");
+    out("    cvttsd2si %%xmm0,%%rdi\n    xorl %%r14d,%%r14d\n");
+    out("    testq %%rdi,%%rdi\n    jns .Lfpd64_bok\n    movabsq $0x7fffffffffffffff,%%rdi\n    jmp .Lfpd64_emit\n");
+    /* fraction = v - trunc(v), scaled by 1e6 and rounded; carry into the integer part */
+    out(".Lfpd64_bok:\n    cvtsi2sdq %%rdi,%%xmm1\n    subsd %%xmm1,%%xmm0\n    mulsd .Lflr_1e6(%%rip),%%xmm0\n    cvtsd2si %%xmm0,%%r14\n");
+    out("    cmpq $1000000,%%r14\n    jb .Lfpd64_emit\n    xorl %%r14d,%%r14d\n    incq %%rdi\n");
+    out(".Lfpd64_emit:\n    call _flr_print_int_nonl\n");
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_dot(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
-    /* fraction: (val - floor(val)) * 1e6, print 6 digits.
-       Use cvtsd2si (round-to-nearest, per MXCSR default) here, not
-       cvttsd2si (always truncates) — truncating this step is what caused
-       3.14159 to print as 3.141589 instead of 3.141590: the double's
-       stored bit pattern is a hair under the decimal value, so the
-       final digit needs to round up, matching what the 32-bit x87
-       implementation already does deliberately (it truncates only for
-       the integer-part extractions, then restores round-to-nearest for
-       this final digit computation). */
-    out("    cvttsd2si %%xmm0,%%rax\n    cvtsi2sdq %%rax,%%xmm1\n");
-    out("    subsd %%xmm1,%%xmm0\n");
-    out("    movsd .Lflr_1e6(%%rip),%%xmm1\n    mulsd %%xmm1,%%xmm0\n");
-    out("    cvtsd2si %%xmm0,%%rax\n    testq %%rax,%%rax\n    jge .Lfpd64_fpos\n    negq %%rax\n");
-    out(".Lfpd64_fpos:\n");
-    /* print 6 zero-padded decimal digits */
-    out("    leaq .Lflr_ibuf+12(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
-    out("    movl $6,%%ecx\n");
+    out("    movq %%r14,%%rax\n");
+    out("    leaq .Lflr_ibuf+12(%%rip),%%r12\n    decq %%r12\n    movl $6,%%ecx\n");
     out(".Lfpd64_fl:\n    movq $10,%%r13\n    xorl %%edx,%%edx\n    divq %%r13\n");
     out("    addb $48,%%dl\n    movb %%dl,(%%r12)\n    decq %%r12\n    loop .Lfpd64_fl\n");
     out("    incq %%r12\n");
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    movq %%r12,%%rsi\n    movq $6,%%rdx\n    syscall\n");
-    /* newline */
     out("    movq $1,%%rax\n    movq $1,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
+    out("    jmp .Lfpd64_ret\n");
+    out(".Lfpd64_special:\n");
+    out("    movq %%xmm0,%%rax\n    movabsq $0x000fffffffffffff,%%rcx\n    andq %%rcx,%%rax\n    jne .Lfpd64_nan\n");
+    out("    movq %%xmm0,%%rax\n    testq %%rax,%%rax\n    js .Lfpd64_ninf\n");
+    out("    leaq .Lflr_inf(%%rip),%%rsi\n    movq $4,%%rdx\n    jmp .Lfpd64_sp_w\n");
+    out(".Lfpd64_ninf:\n    leaq .Lflr_ninf(%%rip),%%rsi\n    movq $5,%%rdx\n    jmp .Lfpd64_sp_w\n");
+    out(".Lfpd64_nan:\n    leaq .Lflr_nan(%%rip),%%rsi\n    movq $4,%%rdx\n");
+    out(".Lfpd64_sp_w:\n    movq $1,%%rax\n    movq $1,%%rdi\n    syscall\n");
+    out(".Lfpd64_ret:\n");
     out("    popq %%r14\n    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
 
     /* print_int_nonl — print int in rdi without newline (helper for double) */
@@ -3548,13 +4032,18 @@ static void emit_strlit(const char *s){
 
 static void emit_data(void){
     out(".section .data\n");
-    if(has_std&&!freestanding){
+    if((has_std&&!freestanding)||long_helpers_emitted){
         out(".Lflr_ibuf:\n    .space 32\n");
         out(".Lflr_nl:\n    .byte 10\n");
         out(".Lflr_dot:\n    .ascii \".\"\n");
         out(".Lflr_minus:\n    .ascii \"-\"\n");
         /* 1000000.0 as IEEE-754 double (little-endian 64-bit) */
         out(".Lflr_1e6:\n    .long 0\n    .long 1093567616\n");
+        /* 9.0e12 — above this v*1e6 would overflow int64, so print_double skips the scaling */
+        out(".Lflr_big:\n    .long 2602565632\n    .long 1117806323\n");
+        out(".Lflr_nan:\n    .ascii \"nan\\n\"\n");
+        out(".Lflr_inf:\n    .ascii \"inf\\n\"\n");
+        out(".Lflr_ninf:\n    .ascii \"-inf\\n\"\n");
         out(".Lflr_assert_msg:\n    .ascii \"assertion failed: \"\n");
     }
     out(".section .rodata\n");
@@ -3639,7 +4128,8 @@ static void codegen(Node *prog){
 static int valid_ext(const char *p){
     const char *e[]={".fl",".fal",".flc",".flsrc",NULL};
     const char *d=strrchr(p,'.');if(!d)return 0;
-    for(int i=0;e[i];i++)if(strcmp(d,e[i])==0)return 1;return 0;
+    for(int i=0;e[i];i++)if(strcmp(d,e[i])==0)return 1;
+    return 0;
 }
 
 int main(int argc,char **argv){

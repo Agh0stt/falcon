@@ -1,0 +1,18 @@
+# EXPECT: 4.500000|10
+import "std"
+func main() -> void {
+    s: double = 0.0
+    i: int = 0
+    while (i < 10) {
+        s += 0.5
+        i += 1
+    }
+    d: double = 5.0
+    n: int = 0
+    while (d > 0.0) {
+        d = d - 0.5
+        n += 1
+    }
+    print(s - 0.5)
+    print(n)
+}

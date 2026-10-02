@@ -1,0 +1,4 @@
+# ERROR: cannot assign str
+import "std"
+func main() -> void { x: int = "str"
+ print(x) }
