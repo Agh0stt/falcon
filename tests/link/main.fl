@@ -1,0 +1,32 @@
+import "std"
+extern counter: int
+extern big: long
+extern ratio: double
+extern name: str
+extern func bump() -> int
+extern func pub() -> int
+extern func scale(x: double, n: long) -> double
+extern func sloc() -> int
+extern func lib_print() -> void
+static hidden: int = 222
+static func helper() -> int { return 2000 }
+func sloc2() -> int {
+    static n: int = 100
+    n += 1
+    return n
+}
+func main() -> void {
+    print(bump())
+    counter += 5
+    lib_print()
+    print(big + 1)
+    print(ratio * 2.0)
+    print(name)
+    print(pub())
+    print(helper() + hidden)
+    print(scale(1.5, 3))
+    print(sloc())
+    print(sloc())
+    print(sloc2())
+    print(sloc())
+}

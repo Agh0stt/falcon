@@ -1,0 +1,13 @@
+# ARCH: 64
+# STDOUT: -9223372036854775808|9223372036854775807|5000000000|-9000000000000|1111
+import "std"
+canary: long = 1111
+func main() -> void {
+    m: long = -9223372036854775807
+    m = m - 1
+    print(_flr_int_to_str(m))
+    print(_flr_int_to_str(9223372036854775807))
+    print(_flr_str_to_int("5000000000"))
+    print(_flr_str_to_int("-9000000000000"))
+    print(canary)
+}

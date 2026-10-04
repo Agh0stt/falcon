@@ -1,0 +1,25 @@
+# STDOUT: 19999900000|1|1|0|7
+import "std"
+struct N { v: int  next: N }
+func main() -> void {
+    head: N = 0
+    i: int = 0
+    while (i < 200000) {
+        n: N = _flr_alloc(16)
+        n.v = i
+        n.next = head
+        head = n
+        i += 1
+    }
+    t: long = 0
+    while (head != 0) { t += head.v  head = head.next }
+    print(t)
+    print(_flr_alloc(0) != 0)
+    z: int = _flr_alloc(3)
+    w: int = _flr_alloc(3)
+    print(w != z)
+    print(_flr_alloc(-1))
+    big: int = _flr_alloc(5000000)
+    __poke(big + 4999996, 7)
+    print(__peek(big + 4999996))
+}

@@ -1,0 +1,4 @@
+# ERROR: conflicts with its earlier declaration
+extern func f() -> int
+extern func f() -> long
+func main() -> void { }

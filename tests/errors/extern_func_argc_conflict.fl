@@ -1,0 +1,4 @@
+# ERROR: conflicts with its earlier declaration
+extern func f(a: int) -> int
+func f(a: int, b: int) -> int { return 1 }
+func main() -> void { }

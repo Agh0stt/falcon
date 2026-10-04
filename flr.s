@@ -19,7 +19,7 @@
 #   _flr_max(a:int, b:int)          -> int
 #   _flr_exit(code:int)             -> void
 #   _flr_assert(cond:int, msg:str)  -> void
-#   _flr_alloc(size:int)            -> ptr   (bump allocator, 1 MB heap)
+#   _flr_alloc(size:int)            -> ptr   (bump allocator over brk, 0 on OOM)
 #   _flr_free(ptr)                  -> void  (no-op)
 
     .section .text
@@ -83,6 +83,7 @@ _flr_print_str:
     pushl %ebp
     movl  %esp, %ebp
     pushl %esi
+    pushl %ebx
     movl  8(%ebp), %esi     # s
     movl  %esi, %ecx
 .Lfps_l:
@@ -103,6 +104,7 @@ _flr_print_str:
     leal  .Lflr_nl, %ecx
     movl  $1,   %edx
     int   $0x80
+    popl  %ebx
     popl  %esi
     leave
     ret
@@ -116,6 +118,7 @@ _flr_print_int:
     movl  %esp, %ebp
     pushl %esi
     pushl %edi
+    pushl %ebx
     movl  8(%ebp), %eax
     leal  .Lflr_ibuf+11, %edi
     movb  $10, (%edi)           # newline sentinel at end
@@ -148,6 +151,7 @@ _flr_print_int:
     movl  $4, %eax
     movl  $1, %ebx
     int   $0x80
+    popl  %ebx
     popl  %edi
     popl  %esi
     leave
@@ -225,7 +229,13 @@ _flr_int_to_str:
     pushl %esi
     pushl %edi
     movl  8(%ebp), %eax
-    leal  .Lflr_ibuf+11, %edi
+    movl  .Lflr_iti, %ecx       # rotate through 8 slots of 32 bytes
+    incl  %ecx
+    andl  $7, %ecx
+    movl  %ecx, .Lflr_iti
+    shll  $5, %ecx
+    leal  .Lflr_its(%ecx), %edi
+    addl  $31, %edi
     movb  $0, (%edi)            # NUL terminator
     decl  %edi
     testl %eax, %eax
@@ -344,7 +354,7 @@ _flr_assert:
     movl  $4,  %eax
     movl  $2,  %ebx
     leal  .Lflr_assert_msg, %ecx
-    movl  $19, %edx
+    movl  $18, %edx
     int   $0x80
     # write user message
     movl  12(%ebp), %esi
@@ -376,18 +386,69 @@ _flr_assert:
     ret
 
 # ─────────────────────────────────────────────────────────────────────
-# alloc(size) -> ptr   bump heap allocator over 1 MB BSS region
+# alloc(size) -> ptr   bump allocator over brk-grown chunks (zeroed, 4-aligned)
+#   Returns 0 when out of memory.  The break is raised by max(size, 1 MB) at a
+#   time, so there is no fixed heap size.
 # free(ptr)           no-op
 # ─────────────────────────────────────────────────────────────────────
 .weak _flr_alloc
 _flr_alloc:
     pushl %ebp
     movl  %esp, %ebp
+    pushl %ebx
+    movl  8(%ebp), %edx
+    addl  $3, %edx
+    jc    .Lfal_fail
+    andl  $-4, %edx
+    jnz   .Lfal_nz
+    movl  $4, %edx
+.Lfal_nz:
     movl  _flr_heap_ptr, %eax
-    movl  8(%ebp), %ecx
-    addl  $3,  %ecx
-    andl  $-4, %ecx             # align to 4 bytes
-    addl  %ecx, _flr_heap_ptr
+    movl  %eax, %ecx
+    addl  %edx, %ecx
+    jc    .Lfal_fail
+    cmpl  _flr_heap_end, %ecx
+    ja    .Lfal_grow
+    movl  %ecx, _flr_heap_ptr
+    popl  %ebx
+    leave
+    ret
+.Lfal_grow:
+    pushl %edx
+    movl  $45, %eax             # sys_brk(0) -> current break
+    xorl  %ebx, %ebx
+    int   $0x80
+    popl  %edx
+    movl  %eax, %ecx
+    movl  %edx, %ebx
+    cmpl  $0x100000, %ebx
+    jae   .Lfal_sz
+    movl  $0x100000, %ebx
+.Lfal_sz:
+    addl  $4095, %ebx
+    jc    .Lfal_fail
+    andl  $-4096, %ebx
+    addl  %ecx, %ebx
+    jc    .Lfal_fail
+    pushl %ecx
+    pushl %edx
+    pushl %ebx
+    movl  $45, %eax             # sys_brk(new break)
+    int   $0x80
+    popl  %ebx
+    popl  %edx
+    popl  %ecx
+    cmpl  %ebx, %eax
+    jb    .Lfal_fail
+    cmpl  _flr_heap_end, %ecx
+    je    .Lfal_ext
+    movl  %ecx, _flr_heap_ptr
+.Lfal_ext:
+    movl  %ebx, _flr_heap_end
+    jmp   .Lfal_nz
+.Lfal_fail:
+    xorl  %eax, %eax
+    popl  %ebx
     leave
     ret
 
@@ -401,15 +462,16 @@ _flr_free:
     .section .data
     .align 4
 .Lflr_ibuf:
-    .space 24                   # scratch buffer for int<->str conversions
+    .space 24                   # scratch buffer for print_int
+.Lflr_its:
+    .space 256                  # 8 x 32-byte slots used by int_to_str
+.Lflr_iti:
+    .long 0
 .Lflr_nl:
     .byte 10                    # newline character
 .Lflr_assert_msg:
     .ascii "assertion failed: "
 _flr_heap_ptr:
-    .long _flr_heap_start
-
-    .section .bss
-    .align 4
-_flr_heap_start:
-    .space 1048576              # 1 MB bump heap
+    .long 0
+_flr_heap_end:
+    .long 0

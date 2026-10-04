@@ -162,7 +162,7 @@ Return `1` (true) or `0` (false). Works for `int`, `long`, `float`, and `double`
 a and b    a or b    not a
 ```
 
-Short-circuits are not guaranteed — both sides may be evaluated.
+`and` / `or` short-circuit: the right operand is only evaluated when needed. The result is always 0 or 1.
 
 ### Bitwise
 
@@ -290,6 +290,10 @@ func main() -> void {
 ./falconc main.fl -o main.s && as --32 main.s -o main.o
 ld -m elf_i386 flr.o lib.o main.o -o prog
 ```
+
+Two objects that both `import "std"` can be linked together (`_start` is weak). An `extern` declaration must match the
+definition's type exactly, and `main` cannot be `static`. A `str` global initialised with a literal works in any object; an
+array-literal global needs a `main` in the same object to initialise it (otherwise it starts at 0 and the compiler warns).
 
 `static` and `extern` are mutually exclusive and only apply at the top level (functions and global variables) — they aren't valid on locals, `let`, or `const`.
 

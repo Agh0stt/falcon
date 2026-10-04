@@ -1,0 +1,11 @@
+# STDOUT: 100%|a%xb%|7%,x,-3|511|511|1
+import "std"
+func main() -> void {
+    print(str_format("100%"))
+    print(str_format("a%xb%", 1))
+    print(str_format("%d%%,%s,%d", 7, "x", -3))
+    a: str = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+    print(_flr_str_len(str_format("%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s", a,a,a,a,a,a,a,a)))
+    print(_flr_str_len(str_format("%s%s%s%s%s%s%s%s", a,a,a,a,a,a,a,a)))
+    print(_flr_str_len(str_format("ab%d", 5)) == 3)
+}

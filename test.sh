@@ -35,7 +35,7 @@ echo "examples: $pass passed, $fail failed"
 extra=0
 echo "== freestanding kernel compiles"
 if ./falconc examples/EXAMPLE-OS/kernel.fl --freestanding -o $W/k.s 2>/dev/null && as --32 $W/k.s -o $W/k.o; then echo "ok"; else echo "FAIL kernel.fl"; extra=1; fi
-for suite in "tests/fp/run.sh tests/fp" "tests/fp/run.sh tests/lang" "tests/errors/run.sh"; do
+for suite in "tests/fp/run.sh tests/fp" "tests/fp/run.sh tests/lang" "tests/errors/run.sh" "tests/rt/run.sh" "tests/link/run.sh"; do
     echo "== $suite"
     out=$(F=. bash $suite 2>&1); rc=$?
     echo "$out" | tail -5

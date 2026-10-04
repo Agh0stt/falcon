@@ -1,0 +1,2 @@
+# ERROR: cannot be static
+static func main() -> void { }

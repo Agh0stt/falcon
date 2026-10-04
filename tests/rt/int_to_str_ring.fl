@@ -1,0 +1,9 @@
+# STDOUT: 12|-7 42|2147483647|-2147483648|0
+import "std"
+func main() -> void {
+    print(str_concat(_flr_int_to_str(1), _flr_int_to_str(2)))
+    print(str_concat(str_concat(_flr_int_to_str(-7), " "), _flr_int_to_str(42)))
+    print(_flr_int_to_str(2147483647))
+    print(_flr_int_to_str(-2147483647 - 1))
+    print(_flr_int_to_str(0))
+}

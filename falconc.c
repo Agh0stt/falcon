@@ -1128,7 +1128,7 @@ static TypeRef *find_tvar(const char *name){
 }
 
 /* ── global variables (declared here so typecheck can register them) ── */
-typedef struct{char *name;TypeRef *type;long long ival;double dval;int has_init;int is_static;int is_extern;}GVar;
+typedef struct{char *name;TypeRef *type;long long ival;double dval;int has_init;int is_static;int is_extern;int sidx1;}GVar;
 static GVar gvars[4096];
 static int  ngvars=0;
 static int  nslocals=0;         /* counter for unique static-local symbol names */
@@ -1507,9 +1507,12 @@ static int fold_const(Node *e,int *is_fp,long long *iv,double *dv){
     default:return 0;
     }
 }
+static int add_strlit(const char *s);
+static int fold_sidx1=0;   /* 1+index of the string literal a `str` global is initialised with, else 0 */
 static void fold_global_init(Node *init,TypeRef *vt,long long *iv,double *dv,const char *name,Node *at){
-    *iv=0;*dv=0.0;
+    *iv=0;*dv=0.0;fold_sidx1=0;
     if(!init)return;
+    if(init->kind==N_STRLIT&&vt&&vt->kind==TY_STR){fold_sidx1=add_strlit(init->sval)+1;return;}
     int fp=0;long long i=0;double d=0.0;
     if(!fold_const(init,&fp,&i,&d)){
         warn("%s:%d: initializer of global '%s' is not a compile-time constant; it will start at 0",
@@ -1557,6 +1560,7 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
                 fold_global_init(n->left,vt,&iv,&dv,n->name,n);
                 gvars[ngvars].ival=iv;
                 gvars[ngvars].dval=dv;
+                gvars[ngvars].sidx1=fold_sidx1;
                 n->ival=ngvars; /* stash gvars index for statement codegen */
                 ngvars++;
             }
@@ -1690,6 +1694,7 @@ static void hoist_global_inits(Node *prog){
         if(n->kind!=N_VARDECL||n->is_const!=2||n->is_extern||!n->left||!n->typeref)continue;
         int fp=0;long long iv=0;double dv=0.0;
         if(fold_const(n->left,&fp,&iv,&dv))continue;
+        if(n->left->kind==N_STRLIT&&n->typeref->kind==TY_STR)continue;   /* emitted statically as a pointer to the literal */
         Node *id=mknode(N_IDENT,n->line);id->name=xstrdup(n->name);id->file=n->file;
         Node *as=mknode(N_ASSIGN,n->line);as->op=xstrdup("=");as->file=n->file;
         as->left=id;as->right=n->left;
@@ -1722,6 +1727,15 @@ static int block_returns(NList *b){
     return 0;
 }
 
+/* strict structural type equality, used to check that redeclarations agree */
+static int decl_type_eq(TypeRef *a,TypeRef *b){
+    if(!a||!b)return 1;
+    if(a->kind!=b->kind)return 0;
+    if(a->kind==TY_STRUCT)return !a->name||!b->name||!strcmp(a->name,b->name);
+    if(a->kind==TY_ARRAY||a->kind==TY_PTR)return decl_type_eq(a->elem,b->elem);
+    return 1;
+}
+
 /* two top-level definitions with the same name: an `extern` declaration may
    coexist with the real definition, anything else is a redefinition */
 static void check_toplevel_dups(Node *prog){
@@ -1733,13 +1747,26 @@ static void check_toplevel_dups(Node *prog){
         if(!isf&&!isg)continue;
         const char *nm=isf?n->fname:n->name;
         if(isf&&nm&&!strcmp(nm,"main")&&!n->is_extern)has_main=1;
+        if(isf&&nm&&!strcmp(nm,"main")&&n->is_static)
+            die("%s:%d: 'main' cannot be static (the entry point could not call it)",n->file,n->line);
         for(int j=0;j<i;j++){
             Node *m=prog->body.d[j];
             int mf=(m->kind==N_FUNC),mg=(m->kind==N_VARDECL&&m->is_const==2);
             if(!(isf?mf:mg))continue;
             const char *mn=mf?m->fname:m->name;
             if(!nm||!mn||strcmp(nm,mn))continue;
-            if(n->is_extern||m->is_extern)continue;
+            if(n->is_extern||m->is_extern){
+                /* an extern declaration and its definition (or a second extern) must agree */
+                int same=1;
+                if(isf){
+                    same=decl_type_eq(n->rettype,m->rettype)&&n->params.n==m->params.n;
+                    for(int k=0;same&&k<n->params.n;k++)same=decl_type_eq(n->params.d[k].type,m->params.d[k].type);
+                } else same=decl_type_eq(n->typeref,m->typeref);
+                if(!same)
+                    die("%s:%d: %s '%s' conflicts with its earlier declaration at %s:%d (different type)",
+                        n->file,n->line,isf?"function":"global",nm,m->file,m->line);
+                continue;
+            }
             die("%s:%d: %s '%s' is already defined (first defined at %s:%d)",
                 n->file,n->line,isf?"function":"global",nm,m->file,m->line);
         }
@@ -1821,6 +1848,7 @@ static void typecheck(Node *prog){
                 fold_global_init(n->left,vt,&iv,&dv,n->name,n);
                 gvars[ngvars].ival=iv;
                 gvars[ngvars].dval=dv;
+                gvars[ngvars].sidx1=fold_sidx1;
                 ngvars++;
             }
         }
@@ -2768,7 +2796,7 @@ static void emit_runtime(void){
        Freestanding programs supply their own _start via an external boot
        stub (see examples/EXAMPLE-OS/boot.s), so this must stay silent then. */
     if(!freestanding){
-        out(".globl _start\n_start:\n");
+        out(".weak _start\n_start:\n");
         out("    xorl %%ebp,%%ebp\n");
         if(has_std){
             /* _flr_alloc only exists when the virtual std runtime is
@@ -2945,7 +2973,8 @@ static void emit_runtime(void){
 
     /* int_to_str */
     out("_flr_int_to_str:\n    pushl %%ebp\n    movl %%esp,%%ebp\n    pushl %%esi\n    pushl %%edi\n");
-    out("    movl 8(%%ebp),%%eax\n    leal .Lflr_ibuf+11,%%edi\n    movb $0,(%%edi)\n    decl %%edi\n");
+    out("    movl 8(%%ebp),%%eax\n    movl .Lflr_iti,%%ecx\n    incl %%ecx\n    andl $7,%%ecx\n    movl %%ecx,.Lflr_iti\n");
+    out("    shll $5,%%ecx\n    leal .Lflr_its(%%ecx),%%edi\n    addl $31,%%edi\n    movb $0,(%%edi)\n    decl %%edi\n");
     out("    testl %%eax,%%eax\n    jge .Lfits_p\n    negl %%eax\n    movl $1,%%esi\n    jmp .Lfits_l\n");
     out(".Lfits_p:\n    xorl %%esi,%%esi\n");
     out(".Lfits_l:\n    movl $10,%%ecx\n    xorl %%edx,%%edx\n    divl %%ecx\n");
@@ -2973,7 +3002,7 @@ static void emit_runtime(void){
     /* assert */
     out("_flr_assert:\n    pushl %%ebp\n    movl %%esp,%%ebp\n");
     out("    movl 8(%%ebp),%%eax\n    testl %%eax,%%eax\n    jne .Lassert_ok\n");
-    out("    movl $4,%%eax\n    movl $2,%%ebx\n    leal .Lflr_assert_msg,%%ecx\n    movl $19,%%edx\n    int $0x80\n");
+    out("    movl $4,%%eax\n    movl $2,%%ebx\n    leal .Lflr_assert_msg,%%ecx\n    movl $18,%%edx\n    int $0x80\n");
     out("    movl 12(%%ebp),%%esi\n    movl %%esi,%%ecx\n");
     out(".Lasssl:\n    cmpb $0,(%%ecx)\n    je .Lasssd\n    incl %%ecx\n    jmp .Lasssl\n");
     out(".Lasssd:\n    subl %%esi,%%ecx\n    movl %%ecx,%%edx\n    movl %%esi,%%ecx\n");
@@ -2982,21 +3011,71 @@ static void emit_runtime(void){
     out("    movl $1,%%ebx\n    movl $1,%%eax\n    int $0x80\n");
     out(".Lassert_ok:\n    leave\n    ret\n\n");
 
-    /* ── dynamic heap via sbrk (sys_brk = 45) ────────────────────
-       _flr_alloc(size) -> ptr
-       Calls brk(0) to get current break, aligns size to 4,
-       then calls brk(break+size) to grow. Simple, no hard cap.     */
+    /* ── heap: user-space bump allocator over brk-grown chunks ─────
+       _flr_alloc(size) -> ptr  (zeroed, 4-byte aligned; 0 if out of memory)
+       .Lflr_hp/.Lflr_he = current bump pointer / end of the owned region.
+       When the region is exhausted the break is raised by max(size,1MB)
+       (page rounded) — 2 syscalls per MB instead of 2 per allocation.  */
     out("_flr_alloc:\n");
-    out("    pushl %%ebp\n    movl %%esp,%%ebp\n    pushl %%ebx\n");
-    /* get current break */
-    out("    movl $45,%%eax\n    xorl %%ebx,%%ebx\n    int $0x80\n");
-    out("    movl %%eax,%%ecx\n"); /* ecx = current break = base of new block */
-    /* align requested size to 4 */
-    out("    movl 8(%%ebp),%%edx\n    addl $3,%%edx\n    andl $-4,%%edx\n");
-    /* new break = old + size */
-    out("    movl $45,%%eax\n    leal (%%ecx,%%edx),%%ebx\n    int $0x80\n");
-    out("    movl %%ecx,%%eax\n"); /* return base of allocated block */
-    out("    popl %%ebx\n    leave\n    ret\n\n");
+    out("    pushl %%ebp\n");
+    out("    movl %%esp,%%ebp\n");
+    out("    pushl %%ebx\n");
+    out("    movl 8(%%ebp),%%edx\n");
+    out("    addl $3,%%edx\n");
+    out("    jc .Lfal_fail\n");
+    out("    andl $-4,%%edx\n");
+    out("    jnz .Lfal_nz\n");
+    out("    movl $4,%%edx\n");
+    out(".Lfal_nz:\n");
+    out("    movl .Lflr_hp,%%eax\n");
+    out("    movl %%eax,%%ecx\n");
+    out("    addl %%edx,%%ecx\n");
+    out("    jc .Lfal_fail\n");
+    out("    cmpl .Lflr_he,%%ecx\n");
+    out("    ja .Lfal_grow\n");
+    out("    movl %%ecx,.Lflr_hp\n");
+    out("    popl %%ebx\n");
+    out("    leave\n");
+    out("    ret\n");
+    out(".Lfal_grow:\n");
+    out("    pushl %%edx\n");
+    out("    movl $45,%%eax\n");
+    out("    xorl %%ebx,%%ebx\n");
+    out("    int $0x80\n");
+    out("    popl %%edx\n");
+    out("    movl %%eax,%%ecx\n");
+    out("    movl %%edx,%%ebx\n");
+    out("    cmpl $0x100000,%%ebx\n");
+    out("    jae .Lfal_sz\n");
+    out("    movl $0x100000,%%ebx\n");
+    out(".Lfal_sz:\n");
+    out("    addl $4095,%%ebx\n");
+    out("    jc .Lfal_fail\n");
+    out("    andl $-4096,%%ebx\n");
+    out("    addl %%ecx,%%ebx\n");
+    out("    jc .Lfal_fail\n");
+    out("    pushl %%ecx\n");
+    out("    pushl %%edx\n");
+    out("    pushl %%ebx\n");
+    out("    movl $45,%%eax\n");
+    out("    int $0x80\n");
+    out("    popl %%ebx\n");
+    out("    popl %%edx\n");
+    out("    popl %%ecx\n");
+    out("    cmpl %%ebx,%%eax\n");
+    out("    jb .Lfal_fail\n");
+    out("    cmpl .Lflr_he,%%ecx\n");
+    out("    je .Lfal_ext\n");
+    out("    movl %%ecx,.Lflr_hp\n");
+    out(".Lfal_ext:\n");
+    out("    movl %%ebx,.Lflr_he\n");
+    out("    jmp .Lfal_nz\n");
+    out(".Lfal_fail:\n");
+    out("    xorl %%eax,%%eax\n");
+    out("    popl %%ebx\n");
+    out("    leave\n");
+    out("    ret\n");
+    out("\n");
     out("_flr_free:\n    ret\n\n");
 
     /* ── str_concat(a:str, b:str) -> str ─────────────────────────
@@ -3037,6 +3116,7 @@ static void emit_runtime(void){
     out("    pushl $512\n    call _flr_alloc\n    addl $4,%%esp\n");
     out("    movl %%eax,%%edi\n"); /* edi = output ptr */
     out("    pushl %%edi\n");      /* save result */
+    out("    leal 511(%%edi),%%edx\n    movl %%edx,.Lflr_sfend\n");  /* output limit: never write past 511 bytes */
     out("    movl 8(%%ebp),%%esi\n");    /* fmt */
     out("    movl 12(%%ebp),%%ecx\n");   /* nargs */
     out("    leal 16(%%ebp),%%ebx\n");   /* &arg0 */
@@ -3048,7 +3128,7 @@ static void emit_runtime(void){
     out("    cmpl $100,%%eax\n    je .Lsfmt_d\n");    /* %d */
     out("    cmpl $115,%%eax\n    je .Lsfmt_s\n");    /* %s */
     /* unknown spec: just copy literal */
-    out("    jmp .Lsfmt_copy\n");
+    out("    decl %%esi\n    movl $37,%%eax\n    jmp .Lsfmt_copy\n");   /* keep the '%' and re-read the char after it */
     /* %d */
     out(".Lsfmt_d:\n");
     out("    incl %%esi\n");
@@ -3070,7 +3150,7 @@ static void emit_runtime(void){
     /* copy int string into output */
     out("    movl %%eax,%%esi\n");
     out(".Lsfmt_dc:\n    movzbl (%%esi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt_dr\n");
-    out("    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_dc\n");
+    out("    cmpl .Lflr_sfend,%%edi\n    jae 1f\n    movb %%al,(%%edi)\n    incl %%edi\n1:\n    incl %%esi\n    jmp .Lsfmt_dc\n");
     out(".Lsfmt_dr:\n");
     out("    popl %%esi\n");
     out("    jmp .Lsfmt_l\n");
@@ -3081,12 +3161,12 @@ static void emit_runtime(void){
     out("    pushl %%esi\n");
     out("    movl (%%ebx),%%esi\n    addl $4,%%ebx\n    decl %%ecx\n");
     out(".Lsfmt_sc:\n    movzbl (%%esi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt_sr\n");
-    out("    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_sc\n");
+    out("    cmpl .Lflr_sfend,%%edi\n    jae 1f\n    movb %%al,(%%edi)\n    incl %%edi\n1:\n    incl %%esi\n    jmp .Lsfmt_sc\n");
     out(".Lsfmt_sr:\n");
     out("    popl %%esi\n");
     out("    jmp .Lsfmt_l\n");
     /* plain copy */
-    out(".Lsfmt_copy:\n    movb %%al,(%%edi)\n    incl %%esi\n    incl %%edi\n    jmp .Lsfmt_l\n");
+    out(".Lsfmt_copy:\n    cmpl .Lflr_sfend,%%edi\n    jae 1f\n    movb %%al,(%%edi)\n    incl %%edi\n1:\n    incl %%esi\n    jmp .Lsfmt_l\n");
     out(".Lsfmt_end:\n    movb $0,(%%edi)\n");
     out("    popl %%eax\n"); /* return result ptr */
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
@@ -3730,7 +3810,7 @@ static void emit_runtime64(void){
     /* Same rationale as emit_runtime() above: _start must exist for any
        hosted program regardless of has_std. */
     if(!freestanding){
-        out(".globl _start\n_start:\n");
+        out(".weak _start\n_start:\n");
         out("    xorl %%ebp,%%ebp\n");
         if(has_std){
             /* Build a Falcon-shaped argv array (16-byte header + 8-byte
@@ -3897,7 +3977,8 @@ static void emit_runtime64(void){
     out("_flr_int_to_str:\n");
     out("    pushq %%rbx\n    pushq %%r12\n");
     out("    movq %%rdi,%%rax\n");
-    out("    leaq .Lflr_ibuf+11(%%rip),%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
+    out("    movl .Lflr_iti(%%rip),%%ecx\n    incl %%ecx\n    andl $7,%%ecx\n    movl %%ecx,.Lflr_iti(%%rip)\n");
+    out("    shlq $5,%%rcx\n    leaq .Lflr_its(%%rip),%%r12\n    addq %%rcx,%%r12\n    addq $31,%%r12\n    movb $0,(%%r12)\n    decq %%r12\n");
     out("    testq %%rax,%%rax\n    jge .Lfits64_p\n    negq %%rax\n    movq $1,%%rbx\n    jmp .Lfits64_l\n");
     out(".Lfits64_p:\n    xorl %%ebx,%%ebx\n");
     out(".Lfits64_l:\n    movq $10,%%rcx\n    xorl %%edx,%%edx\n    divq %%rcx\n");
@@ -3912,7 +3993,7 @@ static void emit_runtime64(void){
     out("    xorl %%eax,%%eax\n    xorl %%ecx,%%ecx\n");
     out("    cmpb $45,(%%rdi)\n    jne .Lfsti64_l\n    movl $1,%%ecx\n    incq %%rdi\n");
     out(".Lfsti64_l:\n    movzbl (%%rdi),%%edx\n    cmpl $48,%%edx\n    jl .Lfsti64_d\n");
-    out("    cmpl $57,%%edx\n    jg .Lfsti64_d\n    imulq $10,%%rax\n    subl $48,%%edx\n    addl %%edx,%%eax\n");
+    out("    cmpl $57,%%edx\n    jg .Lfsti64_d\n    imulq $10,%%rax\n    subl $48,%%edx\n    addq %%rdx,%%rax\n");
     out("    incq %%rdi\n    jmp .Lfsti64_l\n");
     out(".Lfsti64_d:\n    testl %%ecx,%%ecx\n    je .Lfsti64_r\n    negq %%rax\n");
     out(".Lfsti64_r:\n    ret\n\n");
@@ -3925,26 +4006,64 @@ static void emit_runtime64(void){
     /* assert(cond:rdi, msg:rsi) */
     out("_flr_assert:\n");
     out("    testq %%rdi,%%rdi\n    jne .Lassert64_ok\n");
-    out("    movq $1,%%rax\n    movq $2,%%rdi\n    leaq .Lflr_assert_msg(%%rip),%%rsi\n    movq $19,%%rdx\n    syscall\n");
-    out("    pushq %%rsi\n    call _flr_strlen\n    popq %%rsi\n");
-    out("    movq %%rax,%%rdx\n    movq $1,%%rax\n    movq $2,%%rdi\n    syscall\n");
+    out("    pushq %%rsi\n");   /* keep the user message across the prefix write */
+    out("    movq $1,%%rax\n    movq $2,%%rdi\n    leaq .Lflr_assert_msg(%%rip),%%rsi\n    movq $18,%%rdx\n    syscall\n");
+    out("    movq (%%rsp),%%rdi\n    call _flr_strlen\n");
+    out("    movq %%rax,%%rdx\n    movq (%%rsp),%%rsi\n    movq $1,%%rax\n    movq $2,%%rdi\n    syscall\n");
     out("    movq $1,%%rax\n    movq $2,%%rdi\n    leaq .Lflr_nl(%%rip),%%rsi\n    movq $1,%%rdx\n    syscall\n");
     out("    movq $60,%%rax\n    movq $1,%%rdi\n    syscall\n");
     out(".Lassert64_ok:\n    ret\n\n");
 
-    /* alloc(size:rdi) -> rax  — uses mmap(NULL,size,PROT_RW,MAP_ANON|MAP_PRIV,-1,0) */
+    /* alloc(size:rdi) -> rax  — bump allocator over 1MB+ mmap chunks (was: one mmap,
+       i.e. one whole 4KB page, per allocation).  Returns 0 on failure.  */
     out("_flr_alloc:\n");
     out("    pushq %%rbx\n");
-    out("    movq %%rdi,%%rsi\n");            /* length */
-    out("    addq $7,%%rsi\n    andq $-8,%%rsi\n"); /* align to 8 */
-    out("    xorl %%edi,%%edi\n");             /* addr = NULL */
-    out("    movl $3,%%edx\n");               /* PROT_READ|PROT_WRITE */
-    out("    movl $0x22,%%r10d\n");            /* MAP_PRIVATE|MAP_ANONYMOUS */
-    out("    movq $-1,%%r8\n");               /* fd = -1 */
-    out("    xorl %%r9d,%%r9d\n");             /* offset = 0 */
-    out("    movl $9,%%eax\n");               /* sys_mmap */
+    out("    movq %%rdi,%%rsi\n");
+    out("    addq $7,%%rsi\n");
+    out("    jc .Lfal64_fail\n");
+    out("    andq $-8,%%rsi\n");
+    out("    jnz .Lfal64_nz\n");
+    out("    movl $8,%%esi\n");
+    out(".Lfal64_nz:\n");
+    out("    movq .Lflr_hp(%%rip),%%rax\n");
+    out("    movq %%rax,%%rcx\n");
+    out("    addq %%rsi,%%rcx\n");
+    out("    jc .Lfal64_fail\n");
+    out("    cmpq .Lflr_he(%%rip),%%rcx\n");
+    out("    ja .Lfal64_grow\n");
+    out("    movq %%rcx,.Lflr_hp(%%rip)\n");
+    out("    popq %%rbx\n");
+    out("    ret\n");
+    out(".Lfal64_grow:\n");
+    out("    movq %%rsi,%%rbx\n");
+    out("    movq %%rsi,%%rcx\n");
+    out("    cmpq $0x100000,%%rcx\n");
+    out("    jae .Lfal64_sz\n");
+    out("    movl $0x100000,%%ecx\n");
+    out(".Lfal64_sz:\n");
+    out("    addq $4095,%%rcx\n");
+    out("    jc .Lfal64_fail\n");
+    out("    andq $-4096,%%rcx\n");
+    out("    movq %%rcx,%%rsi\n");
+    out("    xorl %%edi,%%edi\n");
+    out("    movl $3,%%edx\n");
+    out("    movl $0x22,%%r10d\n");
+    out("    movq $-1,%%r8\n");
+    out("    xorl %%r9d,%%r9d\n");
+    out("    movl $9,%%eax\n");
     out("    syscall\n");
-    out("    popq %%rbx\n    ret\n\n");
+    out("    cmpq $-4095,%%rax\n");
+    out("    jae .Lfal64_fail\n");
+    out("    movq %%rax,.Lflr_hp(%%rip)\n");
+    out("    leaq (%%rax,%%rsi),%%rcx\n");
+    out("    movq %%rcx,.Lflr_he(%%rip)\n");
+    out("    movq %%rbx,%%rsi\n");
+    out("    jmp .Lfal64_nz\n");
+    out(".Lfal64_fail:\n");
+    out("    xorl %%eax,%%eax\n");
+    out("    popq %%rbx\n");
+    out("    ret\n");
+    out("\n");
     out("_flr_free:\n    ret\n\n");           /* no-op bump */
 
     /* str_concat(a:rdi, b:rsi) -> rax */
@@ -3978,6 +4097,7 @@ static void emit_runtime64(void){
     /* alloc 512 output bytes */
     out("    movq $512,%%rdi\n    call _flr_alloc\n");
     out("    movq %%rax,%%r15\n    pushq %%rax\n"); /* save output ptr */
+    out("    leaq 511(%%rax),%%rdx\n    movq %%rdx,.Lflr_sfend(%%rip)\n");  /* output limit */
     out("    movq %%rax,%%rbx\n");  /* rbx = write ptr */
     out(".Lsfmt64_l:\n");
     out("    movzbl (%%r12),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_end\n");
@@ -3986,7 +4106,7 @@ static void emit_runtime64(void){
     out("    cmpl $37,%%eax\n    je .Lsfmt64_copy\n");
     out("    cmpl $100,%%eax\n    je .Lsfmt64_d\n");
     out("    cmpl $115,%%eax\n    je .Lsfmt64_s\n");
-    out("    jmp .Lsfmt64_copy\n");
+    out("    decq %%r12\n    movl $37,%%eax\n    jmp .Lsfmt64_copy\n");
     /* %d */
     out(".Lsfmt64_d:\n    incq %%r12\n");
     out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
@@ -3999,7 +4119,7 @@ static void emit_runtime64(void){
     out("    movq (%%r14),%%rdi\n    addq $8,%%r14\n    decq %%r13\n");
     out("    call _flr_int_to_str\n    movq %%rax,%%rsi\n");
     out(".Lsfmt64_dc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_dr\n");
-    out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_dc\n");
+    out("    cmpq .Lflr_sfend(%%rip),%%rbx\n    jae 1f\n    movb %%al,(%%rbx)\n    incq %%rbx\n1:\n    incq %%rsi\n    jmp .Lsfmt64_dc\n");
     out(".Lsfmt64_dr:\n");
     out("    jmp .Lsfmt64_l\n");
     /* %s */
@@ -4007,11 +4127,11 @@ static void emit_runtime64(void){
     out("    testq %%r13,%%r13\n    je .Lsfmt64_l\n");
     out("    movq (%%r14),%%rsi\n    addq $8,%%r14\n    decq %%r13\n");
     out(".Lsfmt64_sc:\n    movzbl (%%rsi),%%eax\n    testl %%eax,%%eax\n    je .Lsfmt64_sr\n");
-    out("    movb %%al,(%%rbx)\n    incq %%rsi\n    incq %%rbx\n    jmp .Lsfmt64_sc\n");
+    out("    cmpq .Lflr_sfend(%%rip),%%rbx\n    jae 1f\n    movb %%al,(%%rbx)\n    incq %%rbx\n1:\n    incq %%rsi\n    jmp .Lsfmt64_sc\n");
     out(".Lsfmt64_sr:\n");
     out("    jmp .Lsfmt64_l\n");
     /* plain copy */
-    out(".Lsfmt64_copy:\n    movb %%al,(%%rbx)\n    incq %%r12\n    incq %%rbx\n    jmp .Lsfmt64_l\n");
+    out(".Lsfmt64_copy:\n    cmpq .Lflr_sfend(%%rip),%%rbx\n    jae 1f\n    movb %%al,(%%rbx)\n    incq %%rbx\n1:\n    incq %%r12\n    jmp .Lsfmt64_l\n");
     out(".Lsfmt64_end:\n    movb $0,(%%rbx)\n");
     out("    popq %%rax\n"); /* return result ptr */
     out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
@@ -4034,6 +4154,9 @@ static void emit_data(void){
     out(".section .data\n");
     if((has_std&&!freestanding)||long_helpers_emitted){
         out(".Lflr_ibuf:\n    .space 32\n");
+        out("    .balign 8\n.Lflr_its:\n    .space 256\n.Lflr_iti:\n    .long 0\n    .balign 8\n");
+        if(arch==ARCH_X86_64)out(".Lflr_hp:\n    .quad 0\n.Lflr_he:\n    .quad 0\n.Lflr_sfend:\n    .quad 0\n");
+        else                 out(".Lflr_hp:\n    .long 0\n.Lflr_he:\n    .long 0\n.Lflr_sfend:\n    .long 0\n");
         out(".Lflr_nl:\n    .byte 10\n");
         out(".Lflr_dot:\n    .ascii \".\"\n");
         out(".Lflr_minus:\n    .ascii \"-\"\n");
@@ -4091,6 +4214,8 @@ static void emit_data(void){
                 union{float f;unsigned u;}cv;cv.f=(float)gvars[i].dval;
                 if(sz==8)out("    .long %u\n    .long 0\n",cv.u); /* pad to uniform 8-byte x86-64 slot; only the low 4 bytes are the float (matches how movss reads/writes local float slots) */
                 else     out("    .long %u\n",cv.u);
+            } else if(gvars[i].sidx1){
+                out(sz==8?"    .quad .Lstr%d\n":"    .long .Lstr%d\n",gvars[i].sidx1-1);
             } else if(sz==8){
                 out("    .quad %lld\n",(long long)gvars[i].ival);
             } else {
@@ -4132,39 +4257,53 @@ static int valid_ext(const char *p){
     return 0;
 }
 
+static void usage(FILE *f){
+    fprintf(f,
+        "falconc v6.1 — Falcon language compiler\n"
+        "usage: falconc <input.fl> [-o out.s] [-arch <target>] [--freestanding] [-I<path>...]\n\n"
+        "options:\n"
+        "  -o <file>            write assembly to <file> (default: stdout)\n"
+        "  -I<path>, -I <path>  add an import search directory\n"
+        "  --freestanding       no runtime, no sys_exit (bare metal)\n"
+        "  -h, --help           show this help\n\n"
+        "targets:\n"
+        "  -arch x86-32-linux   32-bit Linux, cdecl, int 0x80  (default)\n"
+        "  -arch x86-64-linux   64-bit Linux, System V AMD64, syscall\n\n"
+        "32-bit linking:\n"
+        "  as --32 out.s -o out.o\n"
+        "  ld -m elf_i386 flr.o out.o -o prog\n\n"
+        "64-bit linking:\n"
+        "  as out.s -o out.o\n"
+        "  ld out.o -o prog\n");
+}
+
 int main(int argc,char **argv){
     const char *infile=NULL,*outfile=NULL;
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--freestanding")==0)     freestanding=1;
-        else if(strcmp(argv[i],"-o")==0&&i+1<argc)  outfile=argv[++i];
-        else if(strncmp(argv[i],"-I",2)==0)          add_search(argv[i]+2);
-        else if(strcmp(argv[i],"-arch")==0&&i+1<argc){
+        const char *a=argv[i];
+        if(strcmp(a,"--freestanding")==0)            freestanding=1;
+        else if(strcmp(a,"-o")==0){
+            if(i+1>=argc)die("option -o needs a file name");
+            outfile=argv[++i];
+        }
+        else if(strcmp(a,"-I")==0){
+            if(i+1>=argc)die("option -I needs a directory");
+            add_search(argv[++i]);
+        }
+        else if(strncmp(a,"-I",2)==0)                add_search(a+2);
+        else if(strcmp(a,"-arch")==0){
+            if(i+1>=argc)die("option -arch needs a target (x86-32-linux or x86-64-linux)");
             i++;
             if(strcmp(argv[i],"x86-64-linux")==0)       arch=ARCH_X86_64;
             else if(strcmp(argv[i],"x86-32-linux")==0)  arch=ARCH_X86_32;
             else die("unknown arch '%s' (valid: x86-32-linux, x86-64-linux)",argv[i]);
         }
-        else if(!infile)                             infile=argv[i];
+        else if(strcmp(a,"-h")==0||strcmp(a,"--help")==0){usage(stdout);return 0;}
+        else if(a[0]=='-'&&a[1])                     die("unknown option '%s' (see falconc --help)",a);
+        else if(!infile)                             infile=a;
+        else die("more than one input file ('%s' and '%s'); use import instead",infile,a);
     }
-    if(!infile){
-        fprintf(stderr,
-            "falconc v4 — Falcon language compiler\n"
-            "usage: falconc <input.fl> [-o out.s] [-arch <target>] [--freestanding] [-I<path>...]\n\n"
-            "targets:\n"
-            "  -arch x86-32-linux   32-bit Linux, cdecl, int 0x80  (default)\n"
-            "  -arch x86-64-linux   64-bit Linux, System V AMD64, syscall\n\n"
-            "new in v4: -arch x86-64-linux\n"
-            "new in v3: float, double, let, const\n"
-            "new in v2: long, type checker, str_concat, str_format\n\n"
-            "32-bit linking:\n"
-            "  as --32 out.s -o out.o\n"
-            "  ld -m elf_i386 flr.o out.o -o prog\n\n"
-            "64-bit linking:\n"
-            "  as out.s -o out.o\n"
-            "  ld out.o -o prog\n"
-        );
-        return 1;
-    }
+    if(!infile){usage(stderr);return 1;}
     if(!valid_ext(infile))die("unrecognised extension (expected .fl .fal .flc .flsrc)");
 
     char *indir=path_dir(infile);add_search(indir);free(indir);

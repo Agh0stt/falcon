@@ -1,0 +1,10 @@
+# EXIT: 1
+# STDOUT: before
+# STDERR: assertion failed: boom
+import "std"
+func main() -> void {
+    _flr_assert(1, "fine")
+    print("before")
+    _flr_assert(0, "boom")
+    print("after")
+}

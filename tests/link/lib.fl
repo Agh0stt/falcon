@@ -1,0 +1,20 @@
+import "std"
+counter: int = 10
+big: long = 5000000000
+ratio: double = 2.5
+name: str = "lib"
+static hidden: int = 111
+static const K: int = 7
+func bump() -> int {
+    counter += 1
+    return counter
+}
+static func helper() -> int { return 1000 }
+func pub() -> int { return helper() + hidden + K }
+func scale(x: double, n: long) -> double { return x * 2.0 + n }
+func sloc() -> int {
+    static n: int = 0
+    n += 1
+    return n
+}
+func lib_print() -> void { print(counter) }
