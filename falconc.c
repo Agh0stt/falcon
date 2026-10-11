@@ -149,7 +149,7 @@ typedef enum{
     TT_AMPERSAND,TT_PIPE,TT_CARET,TT_TILDE,
     TT_SHL,TT_SHR,
     TT_IDENT,TT_NEWLINE,TT_EOF,
-    TT_STATIC,TT_EXTERN
+    TT_STATIC,TT_EXTERN,TT_ANY,TT_AUTO
 }TT;
 
 typedef struct{TT type;char *val;int line;const char *file;}Token;
@@ -170,7 +170,7 @@ static const KW kws[]={
     {"true",TT_TRUE},{"false",TT_FALSE},
     {"break",TT_BREAK},{"continue",TT_CONTINUE},
     {"struct",TT_STRUCT},{"import",TT_IMPORT},{"typedef",TT_TYPEDEF},
-    {"static",TT_STATIC},{"extern",TT_EXTERN},
+    {"static",TT_STATIC},{"extern",TT_EXTERN},{"any",TT_ANY},{"auto",TT_AUTO},
     {NULL,0}
 };
 
@@ -426,7 +426,7 @@ static int match(TT t){skip_nl();if(check(t)){advance();return 1;}return 0;}
    TYPE SYSTEM
    ═══════════════════════════════════════════════════════════════════════ */
 
-typedef enum{TY_VOID,TY_INT,TY_LONG,TY_FLOAT,TY_DOUBLE,TY_STR,TY_BOOL,TY_ARRAY,TY_STRUCT,TY_PTR}TypeKind;
+typedef enum{TY_VOID,TY_INT,TY_LONG,TY_FLOAT,TY_DOUBLE,TY_STR,TY_BOOL,TY_ARRAY,TY_STRUCT,TY_PTR,TY_AUTO,TY_ANY}TypeKind;
 typedef struct TypeRef TypeRef;
 struct TypeRef{TypeKind kind;char *name;TypeRef *elem;};
 
@@ -448,6 +448,8 @@ static const char *type_name(TypeRef *t){
         case TY_ARRAY: return "array";
         case TY_STRUCT:return t->name?t->name:"struct";
         case TY_PTR:   return "ptr";
+        case TY_AUTO:  return "auto";
+        case TY_ANY:   return "any";
     }
     return "unknown";
 }
@@ -537,6 +539,7 @@ struct Node{
     char *callee;NList args;
     NList elems;
     char *import_path;char *name;
+    int is_generic; /* N_FUNC with `any` parameters: a template, instantiated per call-site argument types */
 };
 
 static Node *mknode(NK k,int line){
@@ -569,6 +572,8 @@ static TypeRef *parse_type(void){
         case TT_STR:   return mktype(TY_STR,NULL,NULL);
         case TT_BOOL: return mktype(TY_BOOL,NULL,NULL);
         case TT_VOID: return mktype(TY_VOID,NULL,NULL);
+        case TT_AUTO: return mktype(TY_AUTO,NULL,NULL);
+        case TT_ANY:  return mktype(TY_ANY,NULL,NULL);
         case TT_IDENT:{
             /* check typedef registry first, then fall back to struct name */
             TypeRef *aliased=resolve_typedef(t->val);
@@ -1185,9 +1190,62 @@ static int arch=ARCH_X86_32;   /* default: 32-bit; set from argv before typechec
    per an explicit decision — do not "fix" this with blanket
    truncation in gen_expr64's N_BINOP without that larger change. */
 
+/* print dispatch: `print` (virtual std only), `print_var` (virtual std alias) and the always-on
+   `__print` intrinsic used by std.fl / std64.fl all pick the runtime printer from the argument's type */
+static int is_print_dispatch(const char *c){
+    return (has_std&&(strcmp(c,"print")==0||strcmp(c,"print_var")==0))||strcmp(c,"__print")==0;
+}
+
+/* ── `any` parameters (generic functions) and `auto` variables ───────────
+   A function with an `any` parameter is a template. Each call site with new
+   argument types instantiates a concrete copy (name mangled, file-local) with
+   the `any` params replaced by the argument types, so there is no runtime cost. */
+static Node *tc_prog=NULL;
+static int type_contains(TypeRef *t,TypeKind k){
+    for(;t;t=t->elem)if(t->kind==k)return 1;
+    return 0;
+}
+static NList clone_list(NList l);
+static Node *clone_node(Node *n){
+    if(!n)return NULL;
+    Node *c=malloc(sizeof*c);*c=*n;c->etype=NULL;
+    c->left=clone_node(n->left);c->right=clone_node(n->right);c->cond=clone_node(n->cond);
+    c->for_init=clone_node(n->for_init);c->for_post=clone_node(n->for_post);
+    c->body=clone_list(n->body);c->args=clone_list(n->args);c->elems=clone_list(n->elems);
+    c->else_body=clone_list(n->else_body);
+    if(n->elifs.n){
+        c->elifs.d=malloc(n->elifs.n*sizeof*c->elifs.d);c->elifs.cap=n->elifs.n;
+        for(int i=0;i<n->elifs.n;i++){
+            c->elifs.d[i].cond=clone_node(n->elifs.d[i].cond);
+            c->elifs.d[i].body=clone_list(n->elifs.d[i].body);
+        }
+    }
+    if(n->params.n){
+        c->params.d=malloc(n->params.n*sizeof*c->params.d);c->params.cap=n->params.n;
+        memcpy(c->params.d,n->params.d,n->params.n*sizeof*c->params.d);
+    }
+    return c;
+}
+static NList clone_list(NList l){
+    NList r={0};
+    if(l.n){r.d=malloc(l.n*sizeof*r.d);r.cap=l.n;r.n=l.n;for(int i=0;i<l.n;i++)r.d[i]=clone_node(l.d[i]);}
+    return r;
+}
+static void type_key(TypeRef *t,char *buf,size_t cap){
+    if(!t){strncat(buf,"void",cap-strlen(buf)-1);return;}
+    if(t->kind==TY_ARRAY){strncat(buf,"arr_",cap-strlen(buf)-1);type_key(t->elem,buf,cap);return;}
+    if(t->kind==TY_PTR){strncat(buf,"ptr_",cap-strlen(buf)-1);type_key(t->elem,buf,cap);return;}
+    strncat(buf,type_name(t),cap-strlen(buf)-1);
+}
+static int has_any_param(PList *p){
+    for(int i=0;i<p->n;i++)if(p->d[i].type&&p->d[i].type->kind==TY_ANY)return 1;
+    return 0;
+}
+static FuncSig *instantiate_generic(Node *call);
+
 /* return type of a builtin/runtime call; NULL means "not a known builtin" */
 static TypeRef *builtin_rettype(const char *name){
-    if(has_std&&strcmp(name,"print")==0)     return mktype(TY_VOID,NULL,NULL);
+    if(is_print_dispatch(name))              return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"len")==0)                return mktype(TY_INT,NULL,NULL);
     if(strcmp(name,"str_concat")==0)         return mktype(TY_STR,NULL,NULL);
     if(strcmp(name,"str_format")==0)         return mktype(TY_STR,NULL,NULL);
@@ -1204,6 +1262,9 @@ static TypeRef *builtin_rettype(const char *name){
        gets truncated the moment it's assigned to a var (see emit_data's global
        sizing, which allocates .long for TY_INT and .quad for TY_LONG). */
     if(strcmp(name,"_flr_alloc")==0)         return mktype(arch==ARCH_X86_64?TY_LONG:TY_INT,NULL,NULL);
+    if(strcmp(name,"_flr_read_line")==0)     return mktype(TY_STR,NULL,NULL);
+    if(strcmp(name,"_flr_stdin_eof")==0)     return mktype(TY_INT,NULL,NULL);
+    if(strcmp(name,"_flr_input_str")==0)     return mktype(TY_STR,NULL,NULL);
     if(strcmp(name,"_flr_free")==0)          return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"_flr_exit")==0)          return mktype(TY_VOID,NULL,NULL);
     if(strcmp(name,"_flr_assert")==0)        return mktype(TY_VOID,NULL,NULL);
@@ -1280,6 +1341,37 @@ static void tc_binop_finish(Node *n,TypeRef *lt,TypeRef *rt){
     }
 }
 
+static FuncSig *instantiate_generic(Node *call){
+    Node *tm=NULL;
+    for(int i=0;tc_prog&&i<tc_prog->body.n;i++){
+        Node *f=tc_prog->body.d[i];
+        if(f->kind==N_FUNC&&f->is_generic&&!strcmp(f->fname,call->callee)){tm=f;break;}
+    }
+    if(!tm)die("%s:%d: internal error: no template for '%s'",call->file,call->line,call->callee);
+    char name[512];snprintf(name,sizeof name,"%s",tm->fname);
+    for(int i=0;i<tm->params.n;i++){
+        if(!tm->params.d[i].type||tm->params.d[i].type->kind!=TY_ANY)continue;
+        TypeRef *at=call->args.d[i]->etype;
+        if(!at||at->kind==TY_VOID)
+            die("%s:%d: argument %d of '%s' has no value (void) and cannot be passed as `any`",
+                call->file,call->line,i+1,call->callee);
+        strncat(name,"__",sizeof name-strlen(name)-1);
+        type_key(at,name,sizeof name);
+    }
+    FuncSig *ex=find_func(name);
+    if(ex)return ex;
+    Node *c=clone_node(tm);
+    c->fname=xstrdup(name);c->is_generic=0;c->is_static=1;
+    for(int i=0;i<c->params.n;i++)
+        if(c->params.d[i].type&&c->params.d[i].type->kind==TY_ANY)
+            c->params.d[i].type=call->args.d[i]->etype;
+    if(nfsigs>=1024)die("too many functions");
+    fsigs[nfsigs].name=xstrdup(name);fsigs[nfsigs].rettype=c->rettype;fsigs[nfsigs].params=c->params;
+    nfsigs++;
+    nl_push(&tc_prog->body,c);   /* type-checked and emitted like any other function */
+    return &fsigs[nfsigs-1];
+}
+
 static TypeRef *tc_expr(Node *n,TypeRef *ret){
     if(!n)return mktype(TY_VOID,NULL,NULL);
     switch(n->kind){
@@ -1323,9 +1415,38 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
         /* check each argument */
         for(int i=0;i<n->args.n;i++)tc_expr(n->args.d[i],ret);
         /* virtual std special: print takes any single value */
-        if(has_std&&strcmp(n->callee,"print")==0){
-            if(n->args.n!=1)die("%s:%d: print takes 1 argument",n->file,n->line);
+        if(is_print_dispatch(n->callee)){
+            if(n->args.n!=1)die("%s:%d: %s takes 1 argument",n->file,n->line,n->callee);
+            if(n->args.d[0]->etype&&n->args.d[0]->etype->kind==TY_VOID)
+                die("%s:%d: cannot print a void value",n->file,n->line);
             n->etype=mktype(TY_VOID,NULL,NULL);break;
+        }
+        /* stdin helpers of the virtual std (no std.fl needed). A user function of the
+           same name wins. input/input_str print the prompt without a newline. */
+        if(has_std&&!find_func(n->callee)){
+            const char *c=n->callee;int na=n->args.n;
+            if(!strcmp(c,"read_line")||!strcmp(c,"stdin_eof")||!strcmp(c,"read_int")){
+                if(na!=0)die("%s:%d: %s takes no arguments",n->file,n->line,c);
+                if(!strcmp(c,"read_int")){
+                    Node *rl=mknode(N_CALL,n->line);rl->file=n->file;rl->callee=xstrdup("_flr_read_line");
+                    rl->etype=mktype(TY_STR,NULL,NULL);
+                    nl_push(&n->args,rl);
+                    n->callee=xstrdup("_flr_str_to_int");
+                }else n->callee=xstrdup(!strcmp(c,"read_line")?"_flr_read_line":"_flr_stdin_eof");
+                n->etype=builtin_rettype(n->callee);break;
+            }
+            if(!strcmp(c,"input_str")||!strcmp(c,"input")){
+                if(na!=1)die("%s:%d: %s takes 1 argument (the prompt)",n->file,n->line,c);
+                if(n->args.d[0]->etype->kind!=TY_STR)
+                    die("%s:%d: %s: the prompt must be a str, got %s",n->file,n->line,c,type_name(n->args.d[0]->etype));
+                if(!strcmp(c,"input")){
+                    Node *is=mknode(N_CALL,n->line);is->file=n->file;is->callee=xstrdup("_flr_input_str");
+                    is->args=n->args;is->etype=mktype(TY_STR,NULL,NULL);
+                    NList na2={0};nl_push(&na2,is);n->args=na2;
+                    n->callee=xstrdup("_flr_str_to_int");
+                }else n->callee=xstrdup("_flr_input_str");
+                n->etype=builtin_rettype(n->callee);break;
+            }
         }
         /* str_concat(a:str, b:str) -> str */
         if(strcmp(n->callee,"str_concat")==0){
@@ -1348,6 +1469,13 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
         if(brt){n->etype=brt;break;}
         /* user-defined functions */
         FuncSig *sig=find_func(n->callee);
+        if(sig&&has_any_param(&sig->params)){
+            if(n->args.n!=sig->params.n)
+                die("%s:%d: function '%s' expects %d args, got %d",
+                    n->file,n->line,n->callee,sig->params.n,n->args.n);
+            sig=instantiate_generic(n);
+            n->callee=xstrdup(sig->name);
+        }
         if(sig){
             /* check arg count */
             if(n->args.n!=sig->params.n)
@@ -1531,9 +1659,19 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
     case N_IMPORT:break;
     case N_VARDECL:
     case N_LETDECL:{
+        if(n->typeref&&type_contains(n->typeref,TY_ANY))
+            die("%s:%d: `any` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
+        if(n->typeref&&n->typeref->kind!=TY_AUTO&&type_contains(n->typeref,TY_AUTO))
+            die("%s:%d: `auto` cannot be nested inside another type",n->file,n->line);
+        if(n->typeref&&n->typeref->kind==TY_AUTO){
+            if(!n->left)die("%s:%d: `auto` variable '%s' needs an initializer to infer its type from",n->file,n->line,n->name);
+            n->typeref=NULL;   /* inferred from the initializer below, as `let x = expr` already was */
+        }
         TypeRef *decl=n->typeref;
         if(n->left){
             TypeRef *et=tc_expr(n->left,ret_type);
+            if(!decl&&et&&et->kind==TY_VOID)
+                die("%s:%d: cannot infer the type of '%s' from a void expression",n->file,n->line,n->name);
             if(decl&&!types_compat(decl,et))
                 die("%s:%d: cannot assign %s to variable '%s' of type %s",
                     n->file,n->line,type_name(et),n->name,type_name(decl));
@@ -1570,9 +1708,16 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
         break;
     }
     case N_CONSTDECL:{
+        if(n->typeref&&type_contains(n->typeref,TY_ANY))
+            die("%s:%d: `any` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
+        if(n->typeref&&n->typeref->kind!=TY_AUTO&&type_contains(n->typeref,TY_AUTO))
+            die("%s:%d: `auto` cannot be nested inside another type",n->file,n->line);
+        if(n->typeref&&n->typeref->kind==TY_AUTO)n->typeref=NULL;
         TypeRef *decl=n->typeref;
         if(!n->left)die("%s:%d: const '%s' requires an initializer",n->file,n->line,n->name);
         TypeRef *et=tc_expr(n->left,ret_type);
+        if(!decl&&et&&et->kind==TY_VOID)
+            die("%s:%d: cannot infer the type of '%s' from a void expression",n->file,n->line,n->name);
         if(decl&&!types_compat(decl,et))
             die("%s:%d: cannot assign %s to const '%s' of type %s",
                 n->file,n->line,type_name(et),n->name,type_name(decl));
@@ -1775,7 +1920,41 @@ static void check_toplevel_dups(Node *prog){
         warn("no 'main' function defined (fine for a library object; a linked program needs one)");
 }
 
+static void check_decl_types(Node *prog){
+    for(int i=0;i<prog->body.n;i++){
+        Node *n=prog->body.d[i];
+        if(n->kind==N_FUNC){
+            if(n->rettype&&(type_contains(n->rettype,TY_ANY)||type_contains(n->rettype,TY_AUTO)))
+                die("%s:%d: function '%s': `any`/`auto` cannot be a return type",n->file,n->line,n->fname);
+            for(int j=0;j<n->params.n;j++){
+                TypeRef *pt=n->params.d[j].type;
+                if(type_contains(pt,TY_AUTO))
+                    die("%s:%d: parameter '%s' of '%s': `auto` is for variables; use `any` for a parameter that takes any type",
+                        n->file,n->line,n->params.d[j].name,n->fname);
+                if(type_contains(pt,TY_ANY)&&pt->kind!=TY_ANY)
+                    die("%s:%d: parameter '%s' of '%s': `any` cannot be nested inside another type",
+                        n->file,n->line,n->params.d[j].name,n->fname);
+            }
+            if(has_any_param(&n->params)){
+                if(n->is_extern)die("%s:%d: extern function '%s' cannot have `any` parameters",n->file,n->line,n->fname);
+                n->is_generic=1;
+            }
+        }else if(n->kind==N_VARDECL&&n->is_const==2){
+            if(type_contains(n->typeref,TY_AUTO))
+                die("%s:%d: `auto` is only supported for local variables; give global '%s' an explicit type",n->file,n->line,n->name);
+            if(type_contains(n->typeref,TY_ANY))
+                die("%s:%d: `any` is only allowed as a function parameter type",n->file,n->line);
+        }else if(n->kind==N_STRUCT){
+            for(int j=0;j<n->fields.n;j++)
+                if(type_contains(n->fields.d[j].type,TY_ANY)||type_contains(n->fields.d[j].type,TY_AUTO))
+                    die("%s:%d: struct field '%s': `any`/`auto` are not allowed here",n->file,n->line,n->fields.d[j].name);
+        }
+    }
+}
+
 static void typecheck(Node *prog){
+    tc_prog=prog;
+    check_decl_types(prog);
     check_toplevel_dups(prog);
     fold_prog=prog;
     /* a global `const` must have a compile-time-constant initializer: it is
@@ -1857,7 +2036,7 @@ static void typecheck(Node *prog){
     /* second pass: type-check each function body */
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
-        if(n->kind!=N_FUNC)continue;
+        if(n->kind!=N_FUNC||n->is_generic)continue;   /* templates are only checked per instance */
         int saved_ntvars=ntvars;
         scope_base=ntvars;   /* params form the outermost local scope */
         /* push params into scope */
@@ -2464,9 +2643,9 @@ static void gen_expr(Node *n){
         break;
     case N_CALL:{
         if(is_intrinsic(n->callee)){gen_intrinsic(n);break;}
-        if(has_std){
+        if(has_std||strcmp(n->callee,"__print")==0){
             /* print: dispatch on etype */
-            if(strcmp(n->callee,"print")==0&&n->args.n==1){
+            if(is_print_dispatch(n->callee)&&n->args.n==1){
                 Node *arg=n->args.d[0];
                 int is_long_arg=(arg->etype&&arg->etype->kind==TY_LONG);
                 if(is_long_arg){
@@ -2659,7 +2838,7 @@ static void gen_stmt(Node *n){
         out("    leave\n    ret\n");break;
     case N_EXPRSTMT:{
         Node *e=n->left;
-        if(has_std&&e->kind==N_CALL&&strcmp(e->callee,"print")==0){
+        if(e->kind==N_CALL&&is_print_dispatch(e->callee)){
             if(e->args.n!=1)die("print takes 1 argument");
             Node *arg=e->args.d[0];
             int is_long_arg=(arg->etype&&arg->etype->kind==TY_LONG);
@@ -3170,6 +3349,100 @@ static void emit_runtime(void){
     out(".Lsfmt_end:\n    movb $0,(%%edi)\n");
     out("    popl %%eax\n"); /* return result ptr */
     out("    popl %%ebx\n    popl %%edi\n    popl %%esi\n    leave\n    ret\n\n");
+
+    /* stdin: read_line / stdin_eof */
+    out("_flr_read_line:\n");
+    out("    pushl %%ebp\n");
+    out("    movl %%esp,%%ebp\n");
+    out("    pushl %%esi\n");
+    out("    pushl %%edi\n");
+    out("    pushl %%ebx\n");
+    out("    subl $8,%%esp\n");
+    out("    movl $0,.Lflr_eof\n");
+    out("    movl $128,-16(%%ebp)\n");
+    out("    pushl $128\n");
+    out("    call _flr_alloc\n");
+    out("    addl $4,%%esp\n");
+    out("    movl %%eax,%%esi\n");
+    out("    xorl %%edi,%%edi\n");
+    out(".Lrl_loop:\n");
+    out("    movl $3,%%eax\n");
+    out("    xorl %%ebx,%%ebx\n");
+    out("    leal -20(%%ebp),%%ecx\n");
+    out("    movl $1,%%edx\n");
+    out("    int $0x80\n");
+    out("    cmpl $-4,%%eax\n");
+    out("    je .Lrl_loop\n");
+    out("    testl %%eax,%%eax\n");
+    out("    jle .Lrl_eof\n");
+    out("    movzbl -20(%%ebp),%%eax\n");
+    out("    cmpl $10,%%eax\n");
+    out("    je .Lrl_done\n");
+    out("    leal 1(%%edi),%%edx\n");
+    out("    cmpl -16(%%ebp),%%edx\n");
+    out("    jb .Lrl_store\n");
+    out("    movl -16(%%ebp),%%edx\n");
+    out("    addl %%edx,%%edx\n");
+    out("    movl %%edx,-16(%%ebp)\n");
+    out("    pushl %%edx\n");
+    out("    call _flr_alloc\n");
+    out("    addl $4,%%esp\n");
+    out("    xorl %%edx,%%edx\n");
+    out(".Lrl_cp:\n");
+    out("    cmpl %%edi,%%edx\n");
+    out("    jae .Lrl_cpd\n");
+    out("    movb (%%esi,%%edx),%%bl\n");
+    out("    movb %%bl,(%%eax,%%edx)\n");
+    out("    incl %%edx\n");
+    out("    jmp .Lrl_cp\n");
+    out(".Lrl_cpd:\n");
+    out("    movl %%eax,%%esi\n");
+    out(".Lrl_store:\n");
+    out("    movzbl -20(%%ebp),%%eax\n");
+    out("    movb %%al,(%%esi,%%edi)\n");
+    out("    incl %%edi\n");
+    out("    jmp .Lrl_loop\n");
+    out(".Lrl_eof:\n");
+    out("    testl %%edi,%%edi\n");
+    out("    jne .Lrl_done\n");
+    out("    movl $1,.Lflr_eof\n");
+    out(".Lrl_done:\n");
+    out("    testl %%edi,%%edi\n");
+    out("    je .Lrl_term\n");
+    out("    cmpb $13,-1(%%esi,%%edi)\n");
+    out("    jne .Lrl_term\n");
+    out("    decl %%edi\n");
+    out(".Lrl_term:\n");
+    out("    movb $0,(%%esi,%%edi)\n");
+    out("    movl %%esi,%%eax\n");
+    out("    addl $8,%%esp\n");
+    out("    popl %%ebx\n");
+    out("    popl %%edi\n");
+    out("    popl %%esi\n");
+    out("    leave\n");
+    out("    ret\n");
+    out("_flr_stdin_eof:\n");
+    out("    movl .Lflr_eof,%%eax\n");
+    out("    ret\n");
+    out("\n");
+    /* input_str(prompt): print prompt without newline, then read_line */
+    out("_flr_input_str:\n");
+    out("    movl 4(%%esp),%%ecx\n");
+    out("    movl %%ecx,%%edx\n");
+    out(".Lris_l:\n");
+    out("    cmpb $0,(%%edx)\n");
+    out("    je .Lris_d\n");
+    out("    incl %%edx\n");
+    out("    jmp .Lris_l\n");
+    out(".Lris_d:\n");
+    out("    subl %%ecx,%%edx\n");
+    out("    pushl %%ebx\n");
+    out("    movl $4,%%eax\n");
+    out("    movl $1,%%ebx\n");
+    out("    int $0x80\n");
+    out("    popl %%ebx\n");
+    out("    jmp _flr_read_line\n");
+    out("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3499,7 +3772,7 @@ static void gen_expr64(Node *n){
         int nargs=n->args.n;
 
         /* handle print specially */
-        if(has_std&&strcmp(n->callee,"print")==0&&nargs==1){
+        if(is_print_dispatch(n->callee)&&nargs==1){
             Node *arg=n->args.d[0];
             int is_str=(arg->etype&&arg->etype->kind==TY_STR);
             int is_flt=(arg->etype&&arg->etype->kind==TY_FLOAT);
@@ -3670,7 +3943,7 @@ static void gen_stmt64(Node *n){
     case N_EXPRSTMT:{
         Node *e=n->left;
         /* special-case print at statement level (avoids duplicate dispatch) */
-        if(has_std&&e->kind==N_CALL&&strcmp(e->callee,"print")==0&&e->args.n==1){
+        if(e->kind==N_CALL&&is_print_dispatch(e->callee)&&e->args.n==1){
             Node *arg=e->args.d[0];
             int is_str=(arg->etype&&arg->etype->kind==TY_STR);
             int is_flt=(arg->etype&&arg->etype->kind==TY_FLOAT);
@@ -4135,6 +4408,93 @@ static void emit_runtime64(void){
     out(".Lsfmt64_end:\n    movb $0,(%%rbx)\n");
     out("    popq %%rax\n"); /* return result ptr */
     out("    popq %%r15\n    popq %%r14\n    popq %%r13\n    popq %%r12\n    popq %%rbx\n    ret\n\n");
+
+    /* stdin: read_line / stdin_eof */
+    out("_flr_read_line:\n");
+    out("    pushq %%rbx\n");
+    out("    pushq %%r12\n");
+    out("    pushq %%r13\n");
+    out("    pushq %%r14\n");
+    out("    subq $24,%%rsp\n");
+    out("    movl $0,.Lflr_eof(%%rip)\n");
+    out("    movq $128,%%r14\n");
+    out("    movq %%r14,%%rdi\n");
+    out("    call _flr_alloc\n");
+    out("    movq %%rax,%%r12\n");
+    out("    xorl %%r13d,%%r13d\n");
+    out(".Lrl64_loop:\n");
+    out("    xorl %%eax,%%eax\n");
+    out("    xorl %%edi,%%edi\n");
+    out("    movq %%rsp,%%rsi\n");
+    out("    movl $1,%%edx\n");
+    out("    syscall\n");
+    out("    cmpq $-4,%%rax\n");
+    out("    je .Lrl64_loop\n");
+    out("    testq %%rax,%%rax\n");
+    out("    jle .Lrl64_eof\n");
+    out("    movzbl (%%rsp),%%eax\n");
+    out("    cmpl $10,%%eax\n");
+    out("    je .Lrl64_done\n");
+    out("    leaq 1(%%r13),%%rdx\n");
+    out("    cmpq %%r14,%%rdx\n");
+    out("    jb .Lrl64_store\n");
+    out("    addq %%r14,%%r14\n");
+    out("    movq %%r14,%%rdi\n");
+    out("    call _flr_alloc\n");
+    out("    xorl %%ecx,%%ecx\n");
+    out(".Lrl64_cp:\n");
+    out("    cmpq %%r13,%%rcx\n");
+    out("    jae .Lrl64_cpd\n");
+    out("    movb (%%r12,%%rcx),%%dl\n");
+    out("    movb %%dl,(%%rax,%%rcx)\n");
+    out("    incq %%rcx\n");
+    out("    jmp .Lrl64_cp\n");
+    out(".Lrl64_cpd:\n");
+    out("    movq %%rax,%%r12\n");
+    out(".Lrl64_store:\n");
+    out("    movzbl (%%rsp),%%eax\n");
+    out("    movb %%al,(%%r12,%%r13)\n");
+    out("    incq %%r13\n");
+    out("    jmp .Lrl64_loop\n");
+    out(".Lrl64_eof:\n");
+    out("    testq %%r13,%%r13\n");
+    out("    jne .Lrl64_done\n");
+    out("    movl $1,.Lflr_eof(%%rip)\n");
+    out(".Lrl64_done:\n");
+    out("    testq %%r13,%%r13\n");
+    out("    je .Lrl64_term\n");
+    out("    cmpb $13,-1(%%r12,%%r13)\n");
+    out("    jne .Lrl64_term\n");
+    out("    decq %%r13\n");
+    out(".Lrl64_term:\n");
+    out("    movb $0,(%%r12,%%r13)\n");
+    out("    movq %%r12,%%rax\n");
+    out("    addq $24,%%rsp\n");
+    out("    popq %%r14\n");
+    out("    popq %%r13\n");
+    out("    popq %%r12\n");
+    out("    popq %%rbx\n");
+    out("    ret\n");
+    out("_flr_stdin_eof:\n");
+    out("    movl .Lflr_eof(%%rip),%%eax\n");
+    out("    ret\n");
+    out("\n");
+    /* input_str(prompt): print prompt without newline, then read_line */
+    out("_flr_input_str:\n");
+    out("    movq %%rdi,%%rsi\n");
+    out("    movq %%rdi,%%rdx\n");
+    out(".Lris64_l:\n");
+    out("    cmpb $0,(%%rdx)\n");
+    out("    je .Lris64_d\n");
+    out("    incq %%rdx\n");
+    out("    jmp .Lris64_l\n");
+    out(".Lris64_d:\n");
+    out("    subq %%rsi,%%rdx\n");
+    out("    movl $1,%%eax\n");
+    out("    movl $1,%%edi\n");
+    out("    syscall\n");
+    out("    jmp _flr_read_line\n");
+    out("\n");
 }
 
 static void emit_strlit(const char *s){
@@ -4157,6 +4517,7 @@ static void emit_data(void){
         out("    .balign 8\n.Lflr_its:\n    .space 256\n.Lflr_iti:\n    .long 0\n    .balign 8\n");
         if(arch==ARCH_X86_64)out(".Lflr_hp:\n    .quad 0\n.Lflr_he:\n    .quad 0\n.Lflr_sfend:\n    .quad 0\n");
         else                 out(".Lflr_hp:\n    .long 0\n.Lflr_he:\n    .long 0\n.Lflr_sfend:\n    .long 0\n");
+        out(".Lflr_eof:\n    .long 0\n");
         out(".Lflr_nl:\n    .byte 10\n");
         out(".Lflr_dot:\n    .ascii \".\"\n");
         out(".Lflr_minus:\n    .ascii \"-\"\n");
@@ -4234,12 +4595,12 @@ static void codegen(Node *prog){
     out(".section .text\n\n");
     if(arch==ARCH_X86_64){
         for(int i=0;i<prog->body.n;i++){
-            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern)gen_func64(n);
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern&&!n->is_generic)gen_func64(n);
         }
         emit_runtime64();
     } else {
         for(int i=0;i<prog->body.n;i++){
-            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern)gen_func(n);
+            Node *n=prog->body.d[i];if(n->kind==N_FUNC&&!n->is_extern&&!n->is_generic)gen_func(n);
         }
         emit_runtime();
     }

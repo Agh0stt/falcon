@@ -1,0 +1,25 @@
+# REALSTD: 64
+# STDIN: 41|7|abc|-12|12abc|Alice Bob|~
+# STDOUT: age? 42|7|0|-12|12|name? [Alice Bob]|[]|1
+import "std64"
+func quote(s: str) -> void {
+    print_str("[")
+    print_str(s)
+    print("]")
+}
+func num(n: int) -> void {
+    print_str(int_to_str(n))
+    print_str("\n")
+}
+func main() -> void {
+    n: int = input("age? ")
+    num(n + 1)
+    num(read_int())
+    num(read_int())
+    num(read_int())
+    num(read_int())
+    quote(input_str("name? "))
+    quote(read_line())
+    num(stdin_eof())
+    print_str("")
+}

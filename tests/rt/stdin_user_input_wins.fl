@@ -1,0 +1,10 @@
+# STDIN: 5~
+# STDOUT: mine|100
+import "std"
+func input(p: str) -> int {
+    print("mine")
+    return 100
+}
+func main() -> void {
+    print(input("x? "))
+}

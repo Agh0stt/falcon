@@ -1,0 +1,5 @@
+# ERROR: use `any` for a parameter
+func f(a: auto) -> void {
+}
+func main() -> void {
+}

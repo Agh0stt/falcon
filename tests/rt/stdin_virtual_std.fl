@@ -1,0 +1,16 @@
+# STDIN: 41|7|abc|-12|12abc|Alice Bob|~
+# STDOUT: age? 42|7|0|-12|12|name? Alice Bob|[]|1
+import "std"
+func main() -> void {
+    n: int = input("age? ")
+    print(n + 1)
+    print(read_int())
+    print(read_int())
+    print(read_int())
+    print(read_int())
+    s: str = input_str("name? ")
+    print(s)
+    e: str = read_line()
+    print(str_concat("[", str_concat(e, "]")))
+    print(stdin_eof())
+}

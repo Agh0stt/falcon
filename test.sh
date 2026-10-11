@@ -9,6 +9,7 @@ EXAMPLES=examples
 W=$(mktemp -d); trap 'rm -rf $W' EXIT
 
 [ -f $FLR ] || as --32 flr.s -o $FLR || exit 1
+[ -f ./flrt64.o ] || as flrt64.s -o ./flrt64.o || exit 1
 
 pass=0; fail=0; fail_list=""
 

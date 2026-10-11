@@ -1,0 +1,5 @@
+# ERROR: the prompt must be a str
+import "std"
+func main() -> void {
+    n: int = input(5)
+}

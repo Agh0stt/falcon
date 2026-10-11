@@ -1,0 +1,5 @@
+# ERROR: cannot assign double to
+func main() -> void {
+    x: auto = 5
+    x = 2.5d
+}

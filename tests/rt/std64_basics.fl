@@ -1,0 +1,23 @@
+# REALSTD: 64
+# STDOUT: hello64|-42|7|5|1|0|3|big=1
+import "std64"
+func num(n: int) -> void {
+    print_int(n)
+    print("")
+}
+func main() -> void {
+    print("hello64")
+    num(-42)
+    p: long = alloc(16)
+    q: long = alloc(16)
+    __poke(p, 7)
+    num(__peek(p))
+    num(max(3, min(9, abs(-5))))
+    num(str_eq("a", "a"))
+    num(str_eq("a", "b"))
+    num(str_len("abc"))
+    print_str("big=")
+    big: long = alloc(5000000)
+    __poke(big + 4999996, 7)
+    num(__peek(big + 4999996) == 7)
+}

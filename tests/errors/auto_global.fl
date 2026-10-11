@@ -1,0 +1,4 @@
+# ERROR: only supported for local variables
+g: auto = 5
+func main() -> void {
+}

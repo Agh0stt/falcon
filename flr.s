@@ -21,6 +21,8 @@
 #   _flr_assert(cond:int, msg:str)  -> void
 #   _flr_alloc(size:int)            -> ptr   (bump allocator over brk, 0 on OOM)
 #   _flr_free(ptr)                  -> void  (no-op)
+#   _flr_read_line()                -> str   (one line from stdin, newline stripped)
+#   _flr_stdin_eof()                -> int   (1 if last read_line hit EOF with no data)
 
     .section .text
 
@@ -456,19 +458,328 @@ _flr_alloc:
 _flr_free:
     ret
 
+.weak _flr_read_line
+_flr_read_line:
+    pushl %ebp
+    movl %esp,%ebp
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    subl $8,%esp
+    movl $0,.Lflr_eof
+    movl $128,-16(%ebp)
+    pushl $128
+    call _flr_alloc
+    addl $4,%esp
+    movl %eax,%esi
+    xorl %edi,%edi
+.Lrl_loop:
+    movl $3,%eax
+    xorl %ebx,%ebx
+    leal -20(%ebp),%ecx
+    movl $1,%edx
+    int $0x80
+    cmpl $-4,%eax
+    je .Lrl_loop
+    testl %eax,%eax
+    jle .Lrl_eof
+    movzbl -20(%ebp),%eax
+    cmpl $10,%eax
+    je .Lrl_done
+    leal 1(%edi),%edx
+    cmpl -16(%ebp),%edx
+    jb .Lrl_store
+    movl -16(%ebp),%edx
+    addl %edx,%edx
+    movl %edx,-16(%ebp)
+    pushl %edx
+    call _flr_alloc
+    addl $4,%esp
+    xorl %edx,%edx
+.Lrl_cp:
+    cmpl %edi,%edx
+    jae .Lrl_cpd
+    movb (%esi,%edx),%bl
+    movb %bl,(%eax,%edx)
+    incl %edx
+    jmp .Lrl_cp
+.Lrl_cpd:
+    movl %eax,%esi
+.Lrl_store:
+    movzbl -20(%ebp),%eax
+    movb %al,(%esi,%edi)
+    incl %edi
+    jmp .Lrl_loop
+.Lrl_eof:
+    testl %edi,%edi
+    jne .Lrl_done
+    movl $1,.Lflr_eof
+.Lrl_done:
+    testl %edi,%edi
+    je .Lrl_term
+    cmpb $13,-1(%esi,%edi)
+    jne .Lrl_term
+    decl %edi
+.Lrl_term:
+    movb $0,(%esi,%edi)
+    movl %esi,%eax
+    addl $8,%esp
+    popl %ebx
+    popl %edi
+    popl %esi
+    leave
+    ret
+
+.weak _flr_stdin_eof
+_flr_stdin_eof:
+    movl .Lflr_eof,%eax
+    ret
+
+# print_float / print_double / u64_nonl (extracted from falconc's 32-bit runtime)
+.weak _flr_print_float
+_flr_print_float:
+    pushl %ebp
+    movl %esp,%ebp
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    flds 8(%ebp)
+    subl $8,%esp
+    fstpl (%esp)
+    pushl 4(%esp)
+    pushl 4(%esp)
+    call _flr_print_double
+    addl $8,%esp
+    addl $8,%esp
+    popl %ebx
+    popl %edi
+    popl %esi
+    leave
+    ret
+
+.weak _flr_print_double
+_flr_print_double:
+    pushl %ebp
+    movl %esp,%ebp
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    movl 12(%ebp),%eax
+    movl %eax,%ecx
+    shrl $20,%ecx
+    andl $0x7ff,%ecx
+    cmpl $0x7ff,%ecx
+    je .Lfpd_special
+    testl %eax,%eax
+    jns .Lfpd_pos
+    movl $4,%eax
+    movl $1,%ebx
+    leal .Lflr_minus,%ecx
+    movl $1,%edx
+    int $0x80
+.Lfpd_pos:
+    fldl 8(%ebp)
+    fabs
+    fldl .Lflr_big
+    fucomip %st(1),%st
+    jbe .Lfpd_big
+    fldl .Lflr_1e6
+    fmulp
+    subl $8,%esp
+    fistpll (%esp)
+    popl %eax
+    popl %edx
+    movl %eax,%ebx
+    movl %edx,%eax
+    xorl %edx,%edx
+    movl $1000000,%ecx
+    divl %ecx
+    movl %eax,%esi
+    movl %ebx,%eax
+    divl %ecx
+    movl %edx,%edi
+    movl %esi,%edx
+    jmp .Lfpd_emit
+.Lfpd_big:
+    fld1
+    fldl 8(%ebp)
+    fabs
+.Lfpd_bfp:
+    fprem
+    fnstsw %ax
+    testb $4,%ah
+    jnz .Lfpd_bfp
+    fstp %st(1)
+    fldl .Lflr_1e6
+    fmulp
+    subl $4,%esp
+    fistpl (%esp)
+    popl %edi
+    subl $16,%esp
+    fnstcw 8(%esp)
+    movzwl 8(%esp),%eax
+    orl $0x0c00,%eax
+    movw %ax,10(%esp)
+    fldcw 10(%esp)
+    fistpll (%esp)
+    fldcw 8(%esp)
+    movl (%esp),%eax
+    movl 4(%esp),%edx
+    addl $16,%esp
+    testl %edx,%edx
+    jns .Lfpd_bok
+    movl $0xffffffff,%eax
+    movl $0x7fffffff,%edx
+    xorl %edi,%edi
+    jmp .Lfpd_emit
+.Lfpd_bok:
+    cmpl $1000000,%edi
+    jb .Lfpd_emit
+    xorl %edi,%edi
+    addl $1,%eax
+    adcl $0,%edx
+.Lfpd_emit:
+    call _flr_u64_nonl
+    movl $4,%eax
+    movl $1,%ebx
+    leal .Lflr_dot,%ecx
+    movl $1,%edx
+    int $0x80
+    movl %edi,%eax
+    leal .Lflr_ibuf+11,%edi
+    movl $6,%ecx
+.Lfpd_fl:
+    movl $10,%esi
+    xorl %edx,%edx
+    divl %esi
+    addb $48,%dl
+    movb %dl,(%edi)
+    decl %edi
+    loop .Lfpd_fl
+    incl %edi
+    movl $6,%edx
+    movl %edi,%ecx
+    movl $4,%eax
+    movl $1,%ebx
+    int $0x80
+    movl $4,%eax
+    movl $1,%ebx
+    leal .Lflr_nl,%ecx
+    movl $1,%edx
+    int $0x80
+    jmp .Lfpd_ret
+.Lfpd_special:
+    movl 12(%ebp),%eax
+    andl $0x000fffff,%eax
+    orl 8(%ebp),%eax
+    jne .Lfpd_nan
+    cmpl $0,12(%ebp)
+    jl .Lfpd_ninf
+    leal .Lflr_inf,%ecx
+    movl $4,%edx
+    jmp .Lfpd_sp_w
+.Lfpd_ninf:
+    leal .Lflr_ninf,%ecx
+    movl $5,%edx
+    jmp .Lfpd_sp_w
+.Lfpd_nan:
+    leal .Lflr_nan,%ecx
+    movl $4,%edx
+.Lfpd_sp_w:
+    movl $4,%eax
+    movl $1,%ebx
+    int $0x80
+.Lfpd_ret:
+    popl %ebx
+    popl %edi
+    popl %esi
+    leave
+    ret
+
+.weak _flr_u64_nonl
+_flr_u64_nonl:
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    movl %edx,%ebx
+    movl %eax,%esi
+    leal .Lflr_ibuf+31,%edi
+.Lu64_l:
+    movl $10,%ecx
+    movl %ebx,%eax
+    xorl %edx,%edx
+    divl %ecx
+    movl %eax,%ebx
+    movl %esi,%eax
+    divl %ecx
+    movl %eax,%esi
+    addb $48,%dl
+    movb %dl,(%edi)
+    decl %edi
+    movl %ebx,%eax
+    orl %esi,%eax
+    jne .Lu64_l
+    leal .Lflr_ibuf+31,%edx
+    subl %edi,%edx
+    incl %edi
+    movl %edi,%ecx
+    movl $4,%eax
+    movl $1,%ebx
+    int $0x80
+    popl %ebx
+    popl %edi
+    popl %esi
+    ret
+
+.weak _flr_input_str
+_flr_input_str:
+    movl 4(%esp),%ecx
+    movl %ecx,%edx
+.Lris_l:
+    cmpb $0,(%edx)
+    je .Lris_d
+    incl %edx
+    jmp .Lris_l
+.Lris_d:
+    subl %ecx,%edx
+    pushl %ebx
+    movl $4,%eax
+    movl $1,%ebx
+    int $0x80
+    popl %ebx
+    jmp _flr_read_line
+
 # ─────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────
     .section .data
     .align 4
 .Lflr_ibuf:
-    .space 24                   # scratch buffer for print_int
+    .space 32                   # scratch buffer for print_int
 .Lflr_its:
     .space 256                  # 8 x 32-byte slots used by int_to_str
 .Lflr_iti:
     .long 0
+.Lflr_eof:
+    .long 0                     # set by _flr_read_line on end of input
 .Lflr_nl:
-    .byte 10                    # newline character
+    .byte 10
+.Lflr_dot:
+    .ascii "."
+.Lflr_minus:
+    .ascii "-"
+.Lflr_1e6:
+    .long 0
+    .long 1093567616
+.Lflr_big:
+    .long 2602565632
+    .long 1117806323
+.Lflr_nan:
+    .ascii "nan\n"
+.Lflr_inf:
+    .ascii "inf\n"
+.Lflr_ninf:
+    .ascii "-inf\n"                    # newline character
 .Lflr_assert_msg:
     .ascii "assertion failed: "
 _flr_heap_ptr:

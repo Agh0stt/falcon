@@ -1,0 +1,4 @@
+# ERROR: `any` is only allowed as a function parameter
+func main() -> void {
+    x: any = 5
+}

@@ -1,0 +1,4 @@
+# ERROR: `auto` variable 'x' needs an initializer
+func main() -> void {
+    x: auto
+}

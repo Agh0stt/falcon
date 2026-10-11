@@ -469,10 +469,74 @@ These are available when the virtual built-in `std` is active. Call them directl
 | `_flr_max(a, b)` | Larger of two integers |
 | `_flr_alloc(n)` | Allocate `n` bytes from the dynamic heap, returns pointer |
 | `_flr_free(ptr)` | No-op (bump allocator has no free) |
+| `_flr_read_line()` | Read one line from stdin into a heap string; strips `\n` / `\r\n`; any length; `""` at EOF |
+| `_flr_stdin_eof()` | 1 if the last `_flr_read_line()` hit end of input with no data, else 0 |
 | `_flr_exit(code)` | Exit with status code |
 | `_flr_assert(cond, msg)` | Abort with message if `cond` is 0 |
 | `str_concat(a, b)` | Heap-allocate and return concatenation of two strings |
 | `str_format(fmt, ...)` | Printf-style formatting; supports `%d`, `%s`, `%%`; up to 8 args |
+
+### Reading input (stdin)
+
+Falcon reads stdin through `_flr_read_line()` (both `x86-32-linux` and `x86-64-linux`). The real `std.fl` wraps it with friendlier names (`std.fl` is 32-bit; `std64.fl` has the same functions for 64-bit):
+
+| Function | Description |
+|----------|-------------|
+| `read_line() -> str` | Next line of stdin, newline stripped |
+| `stdin_eof() -> int` | 1 after a `read_line()` that hit EOF with no data |
+| `input_str(prompt) -> str` | Print `prompt` (no newline), then `read_line()` |
+| `read_int() -> int` | `read_line()` parsed as a decimal int (`str_to_int` rules: stops at the first non-digit, so `"12abc"` is 12, `"abc"` is 0, leading spaces give 0) |
+| `input(prompt) -> int` | Print `prompt` (no newline), then `read_int()` |
+
+```
+import "std"
+func main() -> void {
+    age: int = input("age? ")
+    name: str = input_str("name? ")
+    print_str(name)
+    print_int(age)
+}
+```
+
+The built-in `import "std"` (no `std.fl`) provides the same names on both targets: `input`, `input_str`, `read_int`, `read_line`, `stdin_eof`. A function of the same name that you define yourself takes priority. A final line with no trailing newline is returned normally; the *next* call reports EOF. Reads are one byte per syscall (nothing is buffered), so stdin stays correct if you share it with another process.
+
+### 64-bit std (`std64.fl` + `flrt64.s`)
+
+`std.fl` and `flr.s` are the 32-bit pair. For `-arch x86-64-linux` use the 64-bit pair: `import "std64"` and link `flrt64.o` (the same runtime falconc emits for the built-in virtual `std`, with every symbol `.weak`). `std64.fl` has the same functions as `std.fl` (print, input, string, math, alloc, exit, assert) using 64-bit syscall numbers; `alloc` returns `long` and `free` takes `long`.
+
+```
+as flrt64.s -o flrt64.o            # or: make flrt64.o
+./falconc prog.fl -arch x86-64-linux -I. -o prog.s
+as prog.s -o prog.o
+ld flrt64.o prog.o -o prog         # or: make run64 F=prog.fl
+```
+
+### `auto` and `any`
+
+Two type keywords:
+
+- **`auto`** infers a *local* variable's type from its initializer (like Dart's `var`). It needs an initializer, and the type is fixed after that:
+
+  ```
+  n: auto = 41          # int
+  s: auto = "hi"        # str
+  d: auto = 2.5d        # double
+  n = 2.5d              # error: cannot assign double to int
+  ```
+
+  `auto` is not allowed for globals, parameters, return types or struct fields.
+
+- **`any`** is a *parameter* type that accepts a value of any type. The function becomes a template: each distinct combination of argument types gets its own concrete, file-local copy at compile time (no runtime cost, no boxing), so the body is checked with the real types.
+
+  ```
+  func add(a: any, b: any) -> void { print_var(a + b) }
+  add(1, 2)        # int copy      -> 3
+  add(1.5d, 2)     # double/int    -> 3.500000
+  ```
+
+  `any` is only valid on function parameters (not on variables, returns, fields or nested like `[any]`). A variable's type is still fixed at compile time; `any` does not make a dynamically typed variable.
+
+`print_var(x)` (in `std.fl`, `std64.fl`, and built into the virtual `std`) prints any value plus a newline by its type: int/long/bool/pointers as numbers, `str` as text, float/double with 6 decimals. It is a generic function over the `__print(x)` intrinsic, which works with the real std files too (they link `flr.o` / `flrt64.o`). The built-in `print` in the virtual `std` is unchanged.
 
 ---
 

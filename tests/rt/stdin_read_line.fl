@@ -1,0 +1,15 @@
+# STDIN: hello||win\r|tail~
+# STDOUT: [hello]|5|[]|0|[win]|3|[tail]|4|eof=1
+import "std"
+func show(s: str) -> void {
+    print(str_concat("[", str_concat(s, "]")))
+    print(_flr_str_len(s))
+}
+func main() -> void {
+    show(_flr_read_line())
+    show(_flr_read_line())
+    show(_flr_read_line())
+    show(_flr_read_line())
+    _flr_read_line()
+    print(str_concat("eof=", _flr_int_to_str(_flr_stdin_eof())))
+}

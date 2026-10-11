@@ -1,0 +1,6 @@
+# ERROR: cannot infer the type of 'x' from a void
+func f() -> void {
+}
+func main() -> void {
+    x: auto = f()
+}

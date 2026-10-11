@@ -1,0 +1,6 @@
+# ERROR: cannot be a return type
+func f(a: any) -> any {
+    return a
+}
+func main() -> void {
+}

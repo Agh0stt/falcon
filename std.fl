@@ -27,6 +27,47 @@ func print_int(n: int) -> void {
     __syscall(4, 1, int_to_str(n), str_len(int_to_str(n)))
 }
 
+func print_var(s: any) -> void {
+    # Prints any value followed by a newline, picking the printer from its type:
+    # int/long/bool/ptr as numbers, str as text, float/double with 6 decimals.
+    # `any` makes this a template: one concrete copy per argument type used.
+    __print(s)
+}
+
+# ── Input (stdin) ─────────────────────────────────────────────────────
+
+func read_line() -> str {
+    # Reads one line from stdin (fd 0) into a fresh heap string. The trailing
+    # "\n" (and a "\r" before it) is stripped. Lines of any length work.
+    # At end of input it returns "" and stdin_eof() becomes 1.
+    return _flr_read_line()
+}
+
+func stdin_eof() -> int {
+    # 1 if the most recent read_line() hit end of input without reading any
+    # data, else 0. A final line with no trailing newline is returned normally
+    # (stdin_eof() stays 0); the next read_line() then reports EOF.
+    return _flr_stdin_eof()
+}
+
+func input_str(prompt: str) -> str {
+    # Prints prompt (no newline), then returns the next line of stdin.
+    print_str(prompt)
+    return read_line()
+}
+
+func read_int() -> int {
+    # Reads a line and parses it as a decimal int (optional leading '-').
+    # Parsing stops at the first non-digit, so "12abc" -> 12 and "abc" -> 0.
+    return str_to_int(read_line())
+}
+
+func input(prompt: str) -> int {
+    # Prints prompt (no newline), reads a line, and returns it as an int.
+    print_str(prompt)
+    return read_int()
+}
+
 # ── String utilities ──────────────────────────────────────────────────
 
 func str_len(s: str) -> int {
