@@ -1,0 +1,4 @@
+# ERROR: `generic` is only allowed as a function parameter type
+func main() -> void {
+    x: generic = 5
+}

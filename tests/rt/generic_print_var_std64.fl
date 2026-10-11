@@ -1,0 +1,21 @@
+# REALSTD: 64
+# STDOUT: 42|hello|2.500000|1.500000|5000000000|1|7|3.500000
+import "std64"
+func add(a: generic, b: generic) -> void {
+    print_var(a + b)
+}
+func main() -> void {
+    n: auto = 41
+    s: auto = "hello"
+    d: auto = 2.5d
+    f: auto = 1.5
+    big: auto = 5000000000
+    print_var(n + 1)
+    print_var(s)
+    print_var(d)
+    print_var(f)
+    print_var(big)
+    print_var(true)
+    add(3, 4)
+    add(1.5d, 2)
+}

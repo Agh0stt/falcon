@@ -511,7 +511,7 @@ as prog.s -o prog.o
 ld flrt64.o prog.o -o prog         # or: make run64 F=prog.fl
 ```
 
-### `auto` and `any`
+### `auto` and `generic`
 
 Two type keywords:
 
@@ -526,15 +526,15 @@ Two type keywords:
 
   `auto` is not allowed for globals, parameters, return types or struct fields.
 
-- **`any`** is a *parameter* type that accepts a value of any type. The function becomes a template: each distinct combination of argument types gets its own concrete, file-local copy at compile time (no runtime cost, no boxing), so the body is checked with the real types.
+- **`generic`** is a *parameter* type that accepts a value of any type. The function becomes a template: each distinct combination of argument types gets its own concrete, file-local copy at compile time (no runtime cost, no boxing), so the body is checked with the real types.
 
   ```
-  func add(a: any, b: any) -> void { print_var(a + b) }
+  func add(a: generic, b: generic) -> void { print_var(a + b) }
   add(1, 2)        # int copy      -> 3
   add(1.5d, 2)     # double/int    -> 3.500000
   ```
 
-  `any` is only valid on function parameters (not on variables, returns, fields or nested like `[any]`). A variable's type is still fixed at compile time; `any` does not make a dynamically typed variable.
+  `generic` is only valid on function parameters (not on variables, returns, fields or nested like `[generic]`). A variable's type is still fixed at compile time; `generic` does not make a dynamically typed variable. The older spelling `any` is still accepted and means exactly the same thing.
 
 `print_var(x)` (in `std.fl`, `std64.fl`, and built into the virtual `std`) prints any value plus a newline by its type: int/long/bool/pointers as numbers, `str` as text, float/double with 6 decimals. It is a generic function over the `__print(x)` intrinsic, which works with the real std files too (they link `flr.o` / `flrt64.o`). The built-in `print` in the virtual `std` is unchanged.
 

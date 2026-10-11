@@ -27,10 +27,10 @@ func print_int(n: int) -> void {
     __syscall(4, 1, int_to_str(n), str_len(int_to_str(n)))
 }
 
-func print_var(s: any) -> void {
+func print_var(s: generic) -> void {
     # Prints any value followed by a newline, picking the printer from its type:
     # int/long/bool/ptr as numbers, str as text, float/double with 6 decimals.
-    # `any` makes this a template: one concrete copy per argument type used.
+    # `generic` makes this a template: one concrete copy per argument type used.
     __print(s)
 }
 

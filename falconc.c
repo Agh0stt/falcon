@@ -149,7 +149,7 @@ typedef enum{
     TT_AMPERSAND,TT_PIPE,TT_CARET,TT_TILDE,
     TT_SHL,TT_SHR,
     TT_IDENT,TT_NEWLINE,TT_EOF,
-    TT_STATIC,TT_EXTERN,TT_ANY,TT_AUTO
+    TT_STATIC,TT_EXTERN,TT_ANY,TT_AUTO,TT_GENERIC
 }TT;
 
 typedef struct{TT type;char *val;int line;const char *file;}Token;
@@ -170,7 +170,7 @@ static const KW kws[]={
     {"true",TT_TRUE},{"false",TT_FALSE},
     {"break",TT_BREAK},{"continue",TT_CONTINUE},
     {"struct",TT_STRUCT},{"import",TT_IMPORT},{"typedef",TT_TYPEDEF},
-    {"static",TT_STATIC},{"extern",TT_EXTERN},{"any",TT_ANY},{"auto",TT_AUTO},
+    {"static",TT_STATIC},{"extern",TT_EXTERN},{"generic",TT_GENERIC},{"any",TT_ANY},{"auto",TT_AUTO},
     {NULL,0}
 };
 
@@ -449,7 +449,7 @@ static const char *type_name(TypeRef *t){
         case TY_STRUCT:return t->name?t->name:"struct";
         case TY_PTR:   return "ptr";
         case TY_AUTO:  return "auto";
-        case TY_ANY:   return "any";
+        case TY_ANY:   return "generic";
     }
     return "unknown";
 }
@@ -539,7 +539,7 @@ struct Node{
     char *callee;NList args;
     NList elems;
     char *import_path;char *name;
-    int is_generic; /* N_FUNC with `any` parameters: a template, instantiated per call-site argument types */
+    int is_generic; /* N_FUNC with `generic` parameters: a template, instantiated per call-site argument types */
 };
 
 static Node *mknode(NK k,int line){
@@ -573,7 +573,8 @@ static TypeRef *parse_type(void){
         case TT_BOOL: return mktype(TY_BOOL,NULL,NULL);
         case TT_VOID: return mktype(TY_VOID,NULL,NULL);
         case TT_AUTO: return mktype(TY_AUTO,NULL,NULL);
-        case TT_ANY:  return mktype(TY_ANY,NULL,NULL);
+        case TT_ANY:
+        case TT_GENERIC: return mktype(TY_ANY,NULL,NULL);   /* `generic` is the old spelling of `generic` */
         case TT_IDENT:{
             /* check typedef registry first, then fall back to struct name */
             TypeRef *aliased=resolve_typedef(t->val);
@@ -1196,10 +1197,10 @@ static int is_print_dispatch(const char *c){
     return (has_std&&(strcmp(c,"print")==0||strcmp(c,"print_var")==0))||strcmp(c,"__print")==0;
 }
 
-/* ── `any` parameters (generic functions) and `auto` variables ───────────
-   A function with an `any` parameter is a template. Each call site with new
+/* ── `generic` parameters (generic functions) and `auto` variables ───────────
+   A function with an `generic` parameter is a template. Each call site with new
    argument types instantiates a concrete copy (name mangled, file-local) with
-   the `any` params replaced by the argument types, so there is no runtime cost. */
+   the `generic` params replaced by the argument types, so there is no runtime cost. */
 static Node *tc_prog=NULL;
 static int type_contains(TypeRef *t,TypeKind k){
     for(;t;t=t->elem)if(t->kind==k)return 1;
@@ -1353,7 +1354,7 @@ static FuncSig *instantiate_generic(Node *call){
         if(!tm->params.d[i].type||tm->params.d[i].type->kind!=TY_ANY)continue;
         TypeRef *at=call->args.d[i]->etype;
         if(!at||at->kind==TY_VOID)
-            die("%s:%d: argument %d of '%s' has no value (void) and cannot be passed as `any`",
+            die("%s:%d: argument %d of '%s' has no value (void) and cannot be passed as `generic`",
                 call->file,call->line,i+1,call->callee);
         strncat(name,"__",sizeof name-strlen(name)-1);
         type_key(at,name,sizeof name);
@@ -1660,7 +1661,7 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
     case N_VARDECL:
     case N_LETDECL:{
         if(n->typeref&&type_contains(n->typeref,TY_ANY))
-            die("%s:%d: `any` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
+            die("%s:%d: `generic` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
         if(n->typeref&&n->typeref->kind!=TY_AUTO&&type_contains(n->typeref,TY_AUTO))
             die("%s:%d: `auto` cannot be nested inside another type",n->file,n->line);
         if(n->typeref&&n->typeref->kind==TY_AUTO){
@@ -1709,7 +1710,7 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
     }
     case N_CONSTDECL:{
         if(n->typeref&&type_contains(n->typeref,TY_ANY))
-            die("%s:%d: `any` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
+            die("%s:%d: `generic` is only allowed as a function parameter type (use `auto` to infer a variable's type)",n->file,n->line);
         if(n->typeref&&n->typeref->kind!=TY_AUTO&&type_contains(n->typeref,TY_AUTO))
             die("%s:%d: `auto` cannot be nested inside another type",n->file,n->line);
         if(n->typeref&&n->typeref->kind==TY_AUTO)n->typeref=NULL;
@@ -1925,29 +1926,29 @@ static void check_decl_types(Node *prog){
         Node *n=prog->body.d[i];
         if(n->kind==N_FUNC){
             if(n->rettype&&(type_contains(n->rettype,TY_ANY)||type_contains(n->rettype,TY_AUTO)))
-                die("%s:%d: function '%s': `any`/`auto` cannot be a return type",n->file,n->line,n->fname);
+                die("%s:%d: function '%s': `generic`/`auto` cannot be a return type",n->file,n->line,n->fname);
             for(int j=0;j<n->params.n;j++){
                 TypeRef *pt=n->params.d[j].type;
                 if(type_contains(pt,TY_AUTO))
-                    die("%s:%d: parameter '%s' of '%s': `auto` is for variables; use `any` for a parameter that takes any type",
+                    die("%s:%d: parameter '%s' of '%s': `auto` is for variables; use `generic` for a parameter that takes any type",
                         n->file,n->line,n->params.d[j].name,n->fname);
                 if(type_contains(pt,TY_ANY)&&pt->kind!=TY_ANY)
-                    die("%s:%d: parameter '%s' of '%s': `any` cannot be nested inside another type",
+                    die("%s:%d: parameter '%s' of '%s': `generic` cannot be nested inside another type",
                         n->file,n->line,n->params.d[j].name,n->fname);
             }
             if(has_any_param(&n->params)){
-                if(n->is_extern)die("%s:%d: extern function '%s' cannot have `any` parameters",n->file,n->line,n->fname);
+                if(n->is_extern)die("%s:%d: extern function '%s' cannot have `generic` parameters",n->file,n->line,n->fname);
                 n->is_generic=1;
             }
         }else if(n->kind==N_VARDECL&&n->is_const==2){
             if(type_contains(n->typeref,TY_AUTO))
                 die("%s:%d: `auto` is only supported for local variables; give global '%s' an explicit type",n->file,n->line,n->name);
             if(type_contains(n->typeref,TY_ANY))
-                die("%s:%d: `any` is only allowed as a function parameter type",n->file,n->line);
+                die("%s:%d: `generic` is only allowed as a function parameter type",n->file,n->line);
         }else if(n->kind==N_STRUCT){
             for(int j=0;j<n->fields.n;j++)
                 if(type_contains(n->fields.d[j].type,TY_ANY)||type_contains(n->fields.d[j].type,TY_AUTO))
-                    die("%s:%d: struct field '%s': `any`/`auto` are not allowed here",n->file,n->line,n->fields.d[j].name);
+                    die("%s:%d: struct field '%s': `generic`/`auto` are not allowed here",n->file,n->line,n->fields.d[j].name);
         }
     }
 }

@@ -1,0 +1,5 @@
+# ERROR: cannot be nested inside another type
+func f(a: [generic]) -> void {
+}
+func main() -> void {
+}
