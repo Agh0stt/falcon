@@ -705,6 +705,10 @@ The `examples/` folder has one file per language feature, numbered in order.
 | `27_typedef.fl` | Type aliases (`typedef`) |
 | `28_static_extern.fl` | File-local linkage with `static` (see README for a two-file `extern` example) |
 | `29_static_local.fl` | Function-local `static` variable persisting across calls |
+| `30_long_no_std.fl` | `long` arithmetic with no `import "std"`; reports success through its exit code |
+| `31_long_compare_low_word.fl` | `long` comparisons where the high words are equal, so the low words must compare unsigned; reports success through its exit code |
+
+Examples 30 and 31 print nothing. They exit with status 0 on success and 1 on failure, so run them with `echo $?` to see the result.
 
 Run all of them at once:
 
