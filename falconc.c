@@ -590,7 +590,7 @@ static int is_intrinsic(const char *name){
     static const char *ii[]={
         "__syscall","__inb","__outb","__cli","__sti","__hlt",
         "__rdtsc","__peek","__poke","__peekb","__pokeb",
-        "__memset","__memcpy",NULL
+        "__memset","__memcpy","__arch",NULL
     };
     for(int i=0;ii[i];i++)if(strcmp(name,ii[i])==0)return 1;
     return 0;
@@ -1272,6 +1272,7 @@ static TypeRef *builtin_rettype(const char *name){
     /* intrinsics */
     if(strcmp(name,"__syscall")==0)          return mktype(TY_INT,NULL,NULL);
     if(strcmp(name,"__rdtsc")==0)            return mktype(TY_INT,NULL,NULL);
+    if(strcmp(name,"__arch")==0)             return mktype(TY_INT,NULL,NULL);
     if(strcmp(name,"__peek")==0||
        strcmp(name,"__peekb")==0||
        strcmp(name,"__inb")==0)              return mktype(TY_INT,NULL,NULL);
@@ -1371,6 +1372,14 @@ static FuncSig *instantiate_generic(Node *call){
     nfsigs++;
     nl_push(&tc_prog->body,c);   /* type-checked and emitted like any other function */
     return &fsigs[nfsigs-1];
+}
+
+/* len / str_concat / str_format are compiler builtins that also work with a real std.fl
+   (which cannot express them: len reads the array header, str_format is variadic).
+   A user-defined function of the same name takes priority. */
+static int std_builtin_always(const char *c){
+    if(strcmp(c,"len")&&strcmp(c,"str_concat")&&strcmp(c,"str_format"))return 0;
+    return find_func(c)==NULL;
 }
 
 static TypeRef *tc_expr(Node *n,TypeRef *ret){
@@ -2350,6 +2359,7 @@ static void gen_intrinsic(Node *n){
     if(strcmp(nm,"__sti")==0){out("    sti\n    xorl %%eax,%%eax\n");return;}
     if(strcmp(nm,"__hlt")==0){out("    hlt\n    xorl %%eax,%%eax\n");return;}
     if(strcmp(nm,"__rdtsc")==0){out("    rdtsc\n");return;}
+    if(strcmp(nm,"__arch")==0){out("    movl $32,%%eax\n");return;}   /* compile-time target word size */
     if(strcmp(nm,"__peek")==0){
         if(n->args.n!=1)die("__peek takes 1 argument");
         gen_expr(n->args.d[0]);out("    movl (%%eax),%%eax\n");return;
@@ -2644,7 +2654,7 @@ static void gen_expr(Node *n){
         break;
     case N_CALL:{
         if(is_intrinsic(n->callee)){gen_intrinsic(n);break;}
-        if(has_std||strcmp(n->callee,"__print")==0){
+        if(has_std||strcmp(n->callee,"__print")==0||std_builtin_always(n->callee)){
             /* print: dispatch on etype */
             if(is_print_dispatch(n->callee)&&n->args.n==1){
                 Node *arg=n->args.d[0];
@@ -3560,6 +3570,7 @@ static void gen_intrinsic64(Node *n){
     if(strcmp(nm,"__sti")==0){out("    sti\n    xorl %%eax,%%eax\n");return;}
     if(strcmp(nm,"__hlt")==0){out("    hlt\n    xorl %%eax,%%eax\n");return;}
     if(strcmp(nm,"__rdtsc")==0){out("    rdtsc\n    shlq $32,%%rdx\n    orq %%rdx,%%rax\n");return;}
+    if(strcmp(nm,"__arch")==0){out("    movl $64,%%eax\n");return;}   /* compile-time target word size */
     if(strcmp(nm,"__peek")==0){
         /* Falcon's `int` is signed — sign-extend the 4-byte cell into the
            64-bit result register (movslq), matching how the 32-bit backend's
@@ -3791,8 +3802,15 @@ static void gen_expr64(Node *n){
             break;
         }
 
+        /* len(array): the element count lives in the first quad of the array header */
+        if((has_std||std_builtin_always(n->callee))&&strcmp(n->callee,"len")==0&&nargs==1){
+            gen_expr64(n->args.d[0]);
+            out("    movq (%%rax),%%rax\n");
+            break;
+        }
+
         /* str_concat(a,b) */
-        if(has_std&&strcmp(n->callee,"str_concat")==0&&nargs==2){
+        if((has_std||std_builtin_always(n->callee))&&strcmp(n->callee,"str_concat")==0&&nargs==2){
             gen_expr64(n->args.d[1]); out("    pushq %%rax\n");
             gen_expr64(n->args.d[0]);
             out("    movq %%rax,%%rdi\n    popq %%rsi\n");
@@ -3801,7 +3819,7 @@ static void gen_expr64(Node *n){
         }
 
         /* str_format(fmt, ...) */
-        if(has_std&&strcmp(n->callee,"str_format")==0&&nargs>=1){
+        if((has_std||std_builtin_always(n->callee))&&strcmp(n->callee,"str_format")==0&&nargs>=1){
             /* push extra args right-to-left, then nargs-1 count, then fmt */
             for(int i=nargs-1;i>=1;i--){gen_expr64(n->args.d[i]);out("    pushq %%rax\n");}
             out("    pushq $%d\n",nargs-1);

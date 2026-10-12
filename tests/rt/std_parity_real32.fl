@@ -1,0 +1,15 @@
+# REALSTD: 32
+# STDOUT: 3|hello|5|2.500000|5000000000|1|abcd|7-x|0
+import "std"
+func main() -> void {
+    a: auto = [10, 20, 30]
+    print(len(a))
+    print("hello")
+    print(5)
+    print(2.5d)
+    print(5000000000)
+    print(true)
+    print(str_concat("ab", "cd"))
+    print(str_format("%d-%s", 7, "x"))
+    print_var(len(a) == 0)
+}

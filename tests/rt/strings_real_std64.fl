@@ -1,0 +1,33 @@
+# REALSTD: 64
+# STDOUT: world||4|-1|4|1|1|0|2|a+++b+++c|xyz|hi there|2|3|MIXED 1|mixed 1|ababab|cba|-1|1|0|3|yy||98|A|101
+import "std64"
+import "strings"
+func main() -> void {
+    print_var(str_sub("hello world", 6, 5))
+    print_var(str_sub("abc", 5, 2))
+    print_var(str_find("hello world", "o w"))
+    print_var(str_find("hello", "zz"))
+    print_var(str_find_from("abcabc", "bc", 2))
+    print_var(str_contains("hello", "ell"))
+    print_var(str_starts_with("foobar", "foo"))
+    print_var(str_ends_with("foobar", "baz"))
+    print_var(str_count("aaaa", "aa"))
+    print_var(str_replace("a-b-c", "-", "+++"))
+    print_var(str_replace("xyz", "q", "r"))
+    print_var(str_trim("  hi there \r\n"))
+    print_var(_flr_str_len(str_ltrim("  x ")))
+    print_var(_flr_str_len(str_rtrim("  x ")))
+    print_var(str_upper("MiXed 1"))
+    print_var(str_lower("MiXed 1"))
+    print_var(str_repeat("ab", 3))
+    print_var(str_reverse("abc"))
+    print_var(str_cmp("a", "b"))
+    print_var(str_cmp("b", "a"))
+    print_var(str_cmp("x", "x"))
+    print_var(str_split_count("x,yy,zzz", ","))
+    print_var(str_split_get("x,yy,zzz", ",", 1))
+    print_var(str_split_get("x,yy,zzz", ",", 5))
+    print_var(str_at("abc", 1))
+    print_var(str_from_char(65))
+    print_var(char_is_digit(55) + char_is_alpha(55) * 10 + char_is_space(32) * 100)
+}

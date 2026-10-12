@@ -1,0 +1,107 @@
+# std.fl — Falcon Standard Library, x86-32 Linux
+#
+# The real-file version of the built-in `std`: the same names with the same
+# behaviour, so a program compiles the same way with either one.
+#   import "std"      (needs flr.o linked in; use  -I.  to find this file)
+#
+# Not defined here because the compiler provides them (and they also work with
+# this file): len(array), str_concat(a, b), str_format(fmt, ...).
+#
+# Printing:      print(x)  print_var(x)    any type, followed by a newline
+#                                           (int/long/bool/ptr as numbers, str as text,
+#                                            float/double with 6 decimals)
+# Input:         read_line()  read_int()  input(prompt) -> int  input_str(prompt) -> str
+#                stdin_eof()
+# Runtime:       every _flr_* function of flr.o can be called directly.
+
+# ── the built-in std ──────────────────────────────────────────────────
+
+func print(v: generic) -> void {
+    __print(v)
+}
+
+func print_var(v: generic) -> void {
+    __print(v)
+}
+
+func read_line() -> str {
+    # One line from stdin, "\n" / "\r\n" stripped. "" at end of input.
+    return _flr_read_line()
+}
+
+func stdin_eof() -> int {
+    # 1 if the last read_line() hit end of input without reading any data.
+    return _flr_stdin_eof()
+}
+
+func input_str(prompt: str) -> str {
+    # Prints prompt (no newline), then returns the next line.
+    return _flr_input_str(prompt)
+}
+
+func read_int() -> int {
+    # Parsing stops at the first non-digit: "12abc" -> 12, "abc" -> 0.
+    return _flr_str_to_int(_flr_read_line())
+}
+
+func input(prompt: str) -> int {
+    # Prints prompt (no newline), reads a line and returns it as an int.
+    return _flr_str_to_int(_flr_input_str(prompt))
+}
+
+# ── convenience wrappers (not part of the built-in std) ──────────────
+
+func print_str(s: str) -> void {
+    __syscall(4, 1, s, _flr_str_len(s))   # no newline
+}
+
+func print_int(n: int) -> void {
+    print_str(_flr_int_to_str(n))                  # no newline
+}
+
+func str_len(s: str) -> int {
+    return _flr_str_len(s)
+}
+
+func str_eq(a: str, b: str) -> int {
+    return _flr_str_eq(a, b)
+}
+
+func int_to_str(n: int) -> str {
+    return _flr_int_to_str(n)
+}
+
+func str_to_int(s: str) -> int {
+    return _flr_str_to_int(s)
+}
+
+func abs(n: int) -> int {
+    return _flr_abs(n)
+}
+
+func min(a: int, b: int) -> int {
+    return _flr_min(a, b)
+}
+
+func max(a: int, b: int) -> int {
+    return _flr_max(a, b)
+}
+
+func alloc(size: int) -> int {
+    # Zero-initialised heap memory (bump allocator).
+    return _flr_alloc(size)
+}
+
+func free(ptr: int) -> void {
+    # No-op in the bump allocator; for portability.
+    _flr_free(ptr)
+}
+
+func exit(code: int) -> void {
+    _flr_exit(code)
+}
+
+func assert(cond: int, msg: str) -> void {
+    # If cond == 0 prints "assertion failed: <msg>" to stderr and exits with 1.
+    _flr_assert(cond, msg)
+}

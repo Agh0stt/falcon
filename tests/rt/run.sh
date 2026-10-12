@@ -7,6 +7,7 @@
 #   # STDOUT: a|b|c            ('|' = newline)
 #   # STDERR: text             (optional; compared exactly, 1 line)
 #   # STDIN: a|b|c            ('|' = newline, \\r etc. allowed; a trailing newline is added unless the value ends in '~')
+#   # LIBS: 1                (make io.fl / strings.fl importable while keeping the built-in std)
 #   # REALSTD: 32 | 64        (compile against the real std.fl / std64.fl via -I; forces that ARCH and links flr.o / flrt64.o)
 F=${F:-.}
 D=$(dirname "$0")
@@ -19,7 +20,8 @@ for f in $(ls $D/*.fl | sort); do
   want_out=$(sed -n 's/^# STDOUT: //p' $f | head -1 | tr '|' '\n')
   want_err=$(sed -n 's/^# STDERR: //p' $f | head -1)
   has_in=$(grep -c '^# STDIN: ' $f); in_raw=$(sed -n 's/^# STDIN: //p' $f | head -1)
-  realstd=$(sed -n 's/^# REALSTD: //p' $f | head -1); inc=""; rt64="" ; if [ -n "$realstd" ]; then inc="-I$F"; [ "$realstd" = 1 ] && realstd=32; archs=$realstd; [ "$realstd" = 64 ] && rt64="$F/flrt64.o"; fi
+  libs=$(sed -n 's/^# LIBS: //p' $f | head -1)
+  realstd=$(sed -n 's/^# REALSTD: //p' $f | head -1); inc=""; rt64="" ; if [ -n "$realstd" ]; then inc="-I$F"; [ "$realstd" = 1 ] && realstd=32; archs=$realstd; [ "$realstd" = 64 ] && rt64="$F/flrt64.o"; elif [ -n "$libs" ]; then mkdir -p $W/libs; cp $F/io.fl $F/strings.fl $W/libs/; inc="-I$W/libs"; fi
   if [ "${in_raw: -1}" = "~" ]; then printf '%b' "${in_raw%\~}" | tr '|' '\n' > $W/$b.in; else printf '%b\n' "$in_raw" | tr '|' '\n' > $W/$b.in; fi
   [ "$has_in" = 0 ] && : > $W/$b.in
   for arch in 32 64; do

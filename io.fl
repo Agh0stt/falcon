@@ -1,0 +1,285 @@
+# io.fl — Falcon file I/O library (works on x86-32-linux and x86-64-linux)
+#
+#   import "std"        # or "std64" — plus this file:  import "io"
+#   falconc prog.fl -I. -o prog.s        (add -arch x86-64-linux for 64-bit)
+#
+# Thin wrappers over the Linux syscalls (open/read/write/close/lseek/...), with
+# the right syscall numbers chosen per target via __arch(). Needs only the
+# runtime (_flr_alloc / _flr_str_len), so it works with the built-in std,
+# std.fl + flr.o, or std64.fl + flrt64.o.
+#
+# Conventions
+#   * A file is an int file descriptor. 0, 1, 2 are stdin, stdout, stderr.
+#   * Functions that can fail return a NEGATIVE errno (e.g. -2 = no such file);
+#     success is >= 0. fio_error() holds the last fio_open failure.
+#   * Strings are NUL-terminated, so the *text* helpers (fio_read*, fio_write*)
+#     are for text; a NUL byte in a file ends the string you get back.
+#
+# Open modes for fio_open(path, mode), as in C:
+#   "r"  read             "w"  write, create, truncate      "a"  append, create
+#   "r+" read+write       "w+" read+write, create, truncate "a+" read+append, create
+#
+# Functions
+#   fio_open(path, mode) -> int       fd, or -errno
+#   fio_close(fd) -> int
+#   fio_write(fd, s) -> int           bytes written, or -errno
+#   fio_write_line(fd, s) -> int      s followed by "\n"
+#   fio_read(fd, n) -> str            up to n bytes ("" at end of file)
+#   fio_read_line(fd) -> str          one line, "\n" / "\r\n" stripped
+#   fio_eof() -> int                  1 if the last fio_read_line hit EOF with no data
+#   fio_read_all(fd) -> str           everything until end of file
+#   fio_read_file(path) -> str        whole file ("" if it can't be opened; see fio_error)
+#   fio_write_file(path, s) -> int    create/overwrite; bytes written or -errno
+#   fio_append_file(path, s) -> int   append; bytes written or -errno
+#   fio_exists(path) -> int           1 / 0
+#   fio_size(path) -> int             size in bytes, or -errno
+#   fio_seek(fd, offset, whence) -> int   whence: 0 start, 1 current, 2 end
+#   fio_remove(path) -> int           0 or -errno
+#   fio_rename(from_path, to_path) -> int
+#   fio_mkdir(path) -> int            mode 0755
+#   fio_rmdir(path) -> int            remove an empty directory
+#   fio_error() -> int                last fio_open error (negative errno), 0 if none
+
+fio_last_err: int = 0
+fio_eof_flag: int = 0
+
+# ── syscall numbers (x86-32 int 0x80 vs x86-64 syscall) ───────────────
+
+func fio_nr_read() -> int {
+    if (__arch() == 64) { return 0 }
+    return 3
+}
+func fio_nr_write() -> int {
+    if (__arch() == 64) { return 1 }
+    return 4
+}
+func fio_nr_open() -> int {
+    if (__arch() == 64) { return 2 }
+    return 5
+}
+func fio_nr_close() -> int {
+    if (__arch() == 64) { return 3 }
+    return 6
+}
+func fio_nr_lseek() -> int {
+    if (__arch() == 64) { return 8 }
+    return 19
+}
+func fio_nr_unlink() -> int {
+    if (__arch() == 64) { return 87 }
+    return 10
+}
+func fio_nr_rename() -> int {
+    if (__arch() == 64) { return 82 }
+    return 38
+}
+func fio_nr_mkdir() -> int {
+    if (__arch() == 64) { return 83 }
+    return 39
+}
+func fio_nr_rmdir() -> int {
+    if (__arch() == 64) { return 84 }
+    return 40
+}
+
+func fio_copy(dst: long, src: long, n: int) -> void {
+    i: int = 0
+    while (i < n) {
+        __pokeb(dst + i, __peekb(src + i))
+        i += 1
+    }
+}
+
+# ── open / close ──────────────────────────────────────────────────────
+
+func fio_open(path: str, mode: str) -> int {
+    m: long = mode
+    c: int = __peekb(m)
+    plus: int = 0
+    if (c != 0 and __peekb(m + 1) == 43) { plus = 1 }
+    flags: int = 0
+    if (c == 114) {                    # r
+        flags = 0
+        if (plus == 1) { flags = 2 }
+    } else {
+        if (c == 119) {                # w : O_CREAT|O_TRUNC
+            flags = 1 + 64 + 512
+            if (plus == 1) { flags = 2 + 64 + 512 }
+        } else {
+            if (c == 97) {             # a : O_CREAT|O_APPEND
+                flags = 1 + 64 + 1024
+                if (plus == 1) { flags = 2 + 64 + 1024 }
+            } else {
+                fio_last_err = -22     # EINVAL: unknown mode
+                return -22
+            }
+        }
+    }
+    fd: int = __syscall(fio_nr_open(), path, flags, 420)   # 0644
+    if (fd < 0) { fio_last_err = fd }
+    return fd
+}
+
+func fio_close(fd: int) -> int {
+    return __syscall(fio_nr_close(), fd, 0, 0)
+}
+
+func fio_error() -> int {
+    return fio_last_err
+}
+
+# ── writing ───────────────────────────────────────────────────────────
+
+func fio_write(fd: int, s: str) -> int {
+    total: int = _flr_str_len(s)
+    p: long = s
+    sent: int = 0
+    while (sent < total) {
+        r: int = __syscall(fio_nr_write(), fd, p + sent, total - sent)
+        if (r == -4) { continue }          # EINTR: retry
+        if (r < 0) { return r }
+        if (r == 0) { return -5 }          # EIO: no progress
+        sent += r
+    }
+    return sent
+}
+
+func fio_write_line(fd: int, s: str) -> int {
+    w: int = fio_write(fd, s)
+    if (w < 0) { return w }
+    r: int = fio_write(fd, "\n")
+    if (r < 0) { return r }
+    return w + 1
+}
+
+func fio_write_file(path: str, s: str) -> int {
+    fd: int = fio_open(path, "w")
+    if (fd < 0) { return fd }
+    w: int = fio_write(fd, s)
+    fio_close(fd)
+    return w
+}
+
+func fio_append_file(path: str, s: str) -> int {
+    fd: int = fio_open(path, "a")
+    if (fd < 0) { return fd }
+    w: int = fio_write(fd, s)
+    fio_close(fd)
+    return w
+}
+
+# ── reading ───────────────────────────────────────────────────────────
+
+func fio_read(fd: int, n: int) -> str {
+    if (n <= 0) { return "" }
+    buf: long = _flr_alloc(n + 1)
+    got: int = 0
+    while (true) {
+        got = __syscall(fio_nr_read(), fd, buf, n)
+        if (got != -4) { break }
+    }
+    if (got <= 0) { return "" }
+    __pokeb(buf + got, 0)
+    return buf
+}
+
+func fio_read_line(fd: int) -> str {
+    static scratch: long = 0
+    if (scratch == 0) { scratch = _flr_alloc(8) }
+    cap: int = 128
+    buf: long = _flr_alloc(cap)
+    len: int = 0
+    fio_eof_flag = 0
+    while (true) {
+        r: int = __syscall(fio_nr_read(), fd, scratch, 1)
+        if (r == -4) { continue }
+        if (r <= 0) {
+            if (len == 0) { fio_eof_flag = 1 }
+            break
+        }
+        c: int = __peekb(scratch)
+        if (c == 10) { break }
+        if (len + 1 >= cap) {
+            ncap: int = cap * 2
+            nb: long = _flr_alloc(ncap)
+            fio_copy(nb, buf, len)
+            buf = nb
+            cap = ncap
+        }
+        __pokeb(buf + len, c)
+        len += 1
+    }
+    if (len > 0 and __peekb(buf + len - 1) == 13) { len -= 1 }
+    __pokeb(buf + len, 0)
+    return buf
+}
+
+func fio_eof() -> int {
+    return fio_eof_flag
+}
+
+func fio_read_all(fd: int) -> str {
+    cap: int = 4096
+    buf: long = _flr_alloc(cap + 1)
+    len: int = 0
+    while (true) {
+        if (len == cap) {
+            ncap: int = cap * 2
+            nb: long = _flr_alloc(ncap + 1)
+            fio_copy(nb, buf, len)
+            buf = nb
+            cap = ncap
+        }
+        n: int = __syscall(fio_nr_read(), fd, buf + len, cap - len)
+        if (n == -4) { continue }
+        if (n <= 0) { break }
+        len += n
+    }
+    __pokeb(buf + len, 0)
+    return buf
+}
+
+func fio_read_file(path: str) -> str {
+    fd: int = fio_open(path, "r")
+    if (fd < 0) { return "" }
+    data: str = fio_read_all(fd)
+    fio_close(fd)
+    return data
+}
+
+# ── files and directories ─────────────────────────────────────────────
+
+func fio_seek(fd: int, offset: int, whence: int) -> int {
+    return __syscall(fio_nr_lseek(), fd, offset, whence)
+}
+
+func fio_exists(path: str) -> int {
+    fd: int = __syscall(fio_nr_open(), path, 0, 0)
+    if (fd < 0) { return 0 }
+    fio_close(fd)
+    return 1
+}
+
+func fio_size(path: str) -> int {
+    fd: int = fio_open(path, "r")
+    if (fd < 0) { return fd }
+    size: int = fio_seek(fd, 0, 2)
+    fio_close(fd)
+    return size
+}
+
+func fio_remove(path: str) -> int {
+    return __syscall(fio_nr_unlink(), path, 0, 0)
+}
+
+func fio_rename(from_path: str, to_path: str) -> int {
+    return __syscall(fio_nr_rename(), from_path, to_path, 0)
+}
+
+func fio_mkdir(path: str) -> int {
+    return __syscall(fio_nr_mkdir(), path, 493, 0)
+}
+
+func fio_rmdir(path: str) -> int {
+    return __syscall(fio_nr_rmdir(), path, 0, 0)
+}

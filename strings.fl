@@ -1,0 +1,312 @@
+# strings.fl — Falcon string library (works on x86-32-linux and x86-64-linux)
+#
+#   import "std"        # or "std64" — plus this file:  import "strings"
+#   falconc prog.fl -I. -o prog.s        (add -arch x86-64-linux for 64-bit)
+#
+# Needs only the runtime (_flr_alloc / _flr_str_len), so it works with the
+# built-in std, std.fl + flr.o, or std64.fl + flrt64.o. Addresses are held in
+# `long`, which is the same on both targets.
+#
+# Conventions
+#   * Indexes are 0-based byte offsets; strings are plain NUL-terminated bytes.
+#   * Functions never modify their arguments; they return fresh heap strings.
+#   * Out-of-range indexes are clamped (str_sub) or give 0 / -1, never a crash.
+#   * str_find* return -1 when there is no match.
+#
+# Functions
+#   str_at(s, i) -> int               byte at i (0 if out of range)
+#   str_sub(s, start, n) -> str       up to n bytes starting at start
+#   str_find(s, needle) -> int        first index of needle, or -1
+#   str_find_from(s, needle, from)    same, searching from index `from`
+#   str_contains(s, needle) -> int    1 / 0
+#   str_starts_with(s, p) -> int      1 / 0
+#   str_ends_with(s, p) -> int        1 / 0
+#   str_count(s, needle) -> int       non-overlapping matches
+#   str_replace(s, old, new) -> str   replace every non-overlapping `old`
+#   str_trim / str_ltrim / str_rtrim  strip space, \t, \r, \n
+#   str_upper / str_lower             ASCII case conversion
+#   str_repeat(s, n) -> str
+#   str_reverse(s) -> str
+#   str_cmp(a, b) -> int              -1, 0 or 1 (byte order)
+#   str_from_char(c) -> str           one-byte string
+#   str_split_count(s, sep) -> int    number of parts (>= 1)
+#   str_split_get(s, sep, i) -> str   i-th part ("" if out of range)
+#   char_is_digit / char_is_alpha / char_is_space / char_is_alnum (c) -> int
+
+func strings_copy(dst: long, src: long, n: int) -> void {
+    i: int = 0
+    while (i < n) {
+        __pokeb(dst + i, __peekb(src + i))
+        i += 1
+    }
+}
+
+func strings_new(n: int) -> long {
+    # n usable bytes + terminating NUL (heap memory is zero-initialised)
+    return _flr_alloc(n + 1)
+}
+
+# ── characters ────────────────────────────────────────────────────────
+
+func char_is_digit(c: int) -> int {
+    if (c >= 48 and c <= 57) { return 1 }
+    return 0
+}
+
+func char_is_alpha(c: int) -> int {
+    if (c >= 65 and c <= 90) { return 1 }
+    if (c >= 97 and c <= 122) { return 1 }
+    return 0
+}
+
+func char_is_alnum(c: int) -> int {
+    if (char_is_digit(c) == 1) { return 1 }
+    return char_is_alpha(c)
+}
+
+func char_is_space(c: int) -> int {
+    if (c == 32 or c == 9 or c == 10 or c == 13) { return 1 }
+    return 0
+}
+
+# ── access and slicing ────────────────────────────────────────────────
+
+func str_at(s: str, i: int) -> int {
+    if (i < 0) { return 0 }
+    if (i >= _flr_str_len(s)) { return 0 }
+    p: long = s
+    return __peekb(p + i)
+}
+
+func str_sub(s: str, start: int, n: int) -> str {
+    total: int = _flr_str_len(s)
+    if (start < 0) { start = 0 }
+    if (start > total) { start = total }
+    if (n < 0) { n = 0 }
+    if (start + n > total) { n = total - start }
+    out: long = strings_new(n)
+    src: long = s
+    strings_copy(out, src + start, n)
+    return out
+}
+
+func str_from_char(c: int) -> str {
+    out: long = strings_new(1)
+    __pokeb(out, c)
+    return out
+}
+
+# ── searching ─────────────────────────────────────────────────────────
+
+func str_find_from(s: str, needle: str, from: int) -> int {
+    sl: int = _flr_str_len(s)
+    nl: int = _flr_str_len(needle)
+    sp: long = s
+    np: long = needle
+    if (from < 0) { from = 0 }
+    if (nl == 0) {
+        if (from <= sl) { return from }
+        return -1
+    }
+    i: int = from
+    while (i + nl <= sl) {
+        j: int = 0
+        while (j < nl and __peekb(sp + i + j) == __peekb(np + j)) {
+            j += 1
+        }
+        if (j == nl) { return i }
+        i += 1
+    }
+    return -1
+}
+
+func str_find(s: str, needle: str) -> int {
+    return str_find_from(s, needle, 0)
+}
+
+func str_contains(s: str, needle: str) -> int {
+    if (str_find(s, needle) >= 0) { return 1 }
+    return 0
+}
+
+func str_starts_with(s: str, p: str) -> int {
+    pl: int = _flr_str_len(p)
+    if (pl > _flr_str_len(s)) { return 0 }
+    sp: long = s
+    pp: long = p
+    i: int = 0
+    while (i < pl) {
+        if (__peekb(sp + i) != __peekb(pp + i)) { return 0 }
+        i += 1
+    }
+    return 1
+}
+
+func str_ends_with(s: str, p: str) -> int {
+    sl: int = _flr_str_len(s)
+    pl: int = _flr_str_len(p)
+    if (pl > sl) { return 0 }
+    sp: long = s
+    pp: long = p
+    off: int = sl - pl
+    i: int = 0
+    while (i < pl) {
+        if (__peekb(sp + off + i) != __peekb(pp + i)) { return 0 }
+        i += 1
+    }
+    return 1
+}
+
+func str_count(s: str, needle: str) -> int {
+    nl: int = _flr_str_len(needle)
+    if (nl == 0) { return 0 }
+    n: int = 0
+    at: int = str_find_from(s, needle, 0)
+    while (at >= 0) {
+        n += 1
+        at = str_find_from(s, needle, at + nl)
+    }
+    return n
+}
+
+# ── building new strings ──────────────────────────────────────────────
+
+func str_replace(s: str, old: str, new: str) -> str {
+    ol: int = _flr_str_len(old)
+    if (ol == 0) { return s }
+    nl: int = _flr_str_len(new)
+    sl: int = _flr_str_len(s)
+    hits: int = str_count(s, old)
+    if (hits == 0) { return s }
+    out: long = strings_new(sl + hits * (nl - ol))
+    sp: long = s
+    np: long = new
+    w: int = 0
+    r: int = 0
+    while (r < sl) {
+        at: int = str_find_from(s, old, r)
+        if (at < 0) {
+            strings_copy(out + w, sp + r, sl - r)
+            w += sl - r
+            r = sl
+        } else {
+            strings_copy(out + w, sp + r, at - r)
+            w += at - r
+            strings_copy(out + w, np, nl)
+            w += nl
+            r = at + ol
+        }
+    }
+    return out
+}
+
+func str_repeat(s: str, n: int) -> str {
+    if (n <= 0) { return "" }
+    sl: int = _flr_str_len(s)
+    out: long = strings_new(sl * n)
+    sp: long = s
+    i: int = 0
+    while (i < n) {
+        strings_copy(out + i * sl, sp, sl)
+        i += 1
+    }
+    return out
+}
+
+func str_reverse(s: str) -> str {
+    sl: int = _flr_str_len(s)
+    out: long = strings_new(sl)
+    sp: long = s
+    i: int = 0
+    while (i < sl) {
+        __pokeb(out + i, __peekb(sp + sl - 1 - i))
+        i += 1
+    }
+    return out
+}
+
+func str_upper(s: str) -> str {
+    sl: int = _flr_str_len(s)
+    out: long = strings_new(sl)
+    sp: long = s
+    i: int = 0
+    while (i < sl) {
+        c: int = __peekb(sp + i)
+        if (c >= 97 and c <= 122) { c -= 32 }
+        __pokeb(out + i, c)
+        i += 1
+    }
+    return out
+}
+
+func str_lower(s: str) -> str {
+    sl: int = _flr_str_len(s)
+    out: long = strings_new(sl)
+    sp: long = s
+    i: int = 0
+    while (i < sl) {
+        c: int = __peekb(sp + i)
+        if (c >= 65 and c <= 90) { c += 32 }
+        __pokeb(out + i, c)
+        i += 1
+    }
+    return out
+}
+
+# ── trimming ──────────────────────────────────────────────────────────
+
+func str_ltrim(s: str) -> str {
+    sl: int = _flr_str_len(s)
+    sp: long = s
+    a: int = 0
+    while (a < sl and char_is_space(__peekb(sp + a)) == 1) { a += 1 }
+    return str_sub(s, a, sl - a)
+}
+
+func str_rtrim(s: str) -> str {
+    sp: long = s
+    e: int = _flr_str_len(s)
+    while (e > 0 and char_is_space(__peekb(sp + e - 1)) == 1) { e -= 1 }
+    return str_sub(s, 0, e)
+}
+
+func str_trim(s: str) -> str {
+    return str_rtrim(str_ltrim(s))
+}
+
+# ── comparing and splitting ───────────────────────────────────────────
+
+func str_cmp(a: str, b: str) -> int {
+    ap: long = a
+    bp: long = b
+    i: int = 0
+    while (true) {
+        x: int = __peekb(ap + i)
+        y: int = __peekb(bp + i)
+        if (x < y) { return -1 }
+        if (x > y) { return 1 }
+        if (x == 0) { return 0 }
+        i += 1
+    }
+    return 0
+}
+
+func str_split_count(s: str, sep: str) -> int {
+    return str_count(s, sep) + 1
+}
+
+func str_split_get(s: str, sep: str, idx: int) -> str {
+    sl: int = _flr_str_len(sep)
+    if (idx < 0) { return "" }
+    start: int = 0
+    k: int = 0
+    while (k < idx) {
+        at: int = str_find_from(s, sep, start)
+        if (at < 0 or sl == 0) { return "" }
+        start = at + sl
+        k += 1
+    }
+    stop: int = str_find_from(s, sep, start)
+    if (stop < 0 or sl == 0) { stop = _flr_str_len(s) }
+    return str_sub(s, start, stop - start)
+}

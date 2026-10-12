@@ -749,6 +749,157 @@ _flr_input_str:
     popl %ebx
     jmp _flr_read_line
 
+# str_concat / str_format (extracted from falconc's 32-bit runtime)
+.weak _flr_str_concat
+_flr_str_concat:
+    pushl %ebp
+    movl %esp,%ebp
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    movl 8(%ebp),%esi
+    movl 12(%ebp),%edi
+    pushl %esi
+    call _flr_strlen
+    addl $4,%esp
+    movl %eax,%ebx
+    pushl %edi
+    call _flr_strlen
+    addl $4,%esp
+    addl %ebx,%eax
+    incl %eax
+    pushl %eax
+    call _flr_alloc
+    addl $4,%esp
+    pushl %eax
+    movl %eax,%edi
+.Lsca_l:
+    movzbl (%esi),%ecx
+    testl %ecx,%ecx
+    je .Lsca_d
+    movb %cl,(%edi)
+    incl %esi
+    incl %edi
+    jmp .Lsca_l
+.Lsca_d:
+    movl 12(%ebp),%esi
+.Lscb_l:
+    movzbl (%esi),%ecx
+    movb %cl,(%edi)
+    testl %ecx,%ecx
+    je .Lscb_d
+    incl %esi
+    incl %edi
+    jmp .Lscb_l
+.Lscb_d:
+    popl %eax
+    popl %ebx
+    popl %edi
+    popl %esi
+    leave
+    ret
+
+.weak _flr_str_format
+_flr_str_format:
+    pushl %ebp
+    movl %esp,%ebp
+    pushl %esi
+    pushl %edi
+    pushl %ebx
+    pushl $512
+    call _flr_alloc
+    addl $4,%esp
+    movl %eax,%edi
+    pushl %edi
+    leal 511(%edi),%edx
+    movl %edx,.Lflr_sfend
+    movl 8(%ebp),%esi
+    movl 12(%ebp),%ecx
+    leal 16(%ebp),%ebx
+.Lsfmt_l:
+    movzbl (%esi),%eax
+    testl %eax,%eax
+    je .Lsfmt_end
+    cmpl $37,%eax
+    jne .Lsfmt_copy
+    incl %esi
+    movzbl (%esi),%eax
+    cmpl $37,%eax
+    je .Lsfmt_copy
+    cmpl $100,%eax
+    je .Lsfmt_d
+    cmpl $115,%eax
+    je .Lsfmt_s
+    decl %esi
+    movl $37,%eax
+    jmp .Lsfmt_copy
+.Lsfmt_d:
+    incl %esi
+    testl %ecx,%ecx
+    je .Lsfmt_l
+    pushl %esi
+    movl (%ebx),%eax
+    addl $4,%ebx
+    decl %ecx
+    pushl %ecx
+    pushl %eax
+    call _flr_int_to_str
+    addl $4,%esp
+    popl %ecx
+    movl %eax,%esi
+.Lsfmt_dc:
+    movzbl (%esi),%eax
+    testl %eax,%eax
+    je .Lsfmt_dr
+    cmpl .Lflr_sfend,%edi
+    jae 1f
+    movb %al,(%edi)
+    incl %edi
+1:
+    incl %esi
+    jmp .Lsfmt_dc
+.Lsfmt_dr:
+    popl %esi
+    jmp .Lsfmt_l
+.Lsfmt_s:
+    incl %esi
+    testl %ecx,%ecx
+    je .Lsfmt_l
+    pushl %esi
+    movl (%ebx),%esi
+    addl $4,%ebx
+    decl %ecx
+.Lsfmt_sc:
+    movzbl (%esi),%eax
+    testl %eax,%eax
+    je .Lsfmt_sr
+    cmpl .Lflr_sfend,%edi
+    jae 1f
+    movb %al,(%edi)
+    incl %edi
+1:
+    incl %esi
+    jmp .Lsfmt_sc
+.Lsfmt_sr:
+    popl %esi
+    jmp .Lsfmt_l
+.Lsfmt_copy:
+    cmpl .Lflr_sfend,%edi
+    jae 1f
+    movb %al,(%edi)
+    incl %edi
+1:
+    incl %esi
+    jmp .Lsfmt_l
+.Lsfmt_end:
+    movb $0,(%edi)
+    popl %eax
+    popl %ebx
+    popl %edi
+    popl %esi
+    leave
+    ret
+
 # ─────────────────────────────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────────────────────────────
@@ -760,6 +911,8 @@ _flr_input_str:
     .space 256                  # 8 x 32-byte slots used by int_to_str
 .Lflr_iti:
     .long 0
+.Lflr_sfend:
+    .long 0                     # str_format output limit
 .Lflr_eof:
     .long 0                     # set by _flr_read_line on end of input
 .Lflr_nl:

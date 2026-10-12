@@ -1,74 +1,63 @@
-# std.fl — Falcon Standard Library
-# Thin wrappers over the _flr_* symbols in flr.o / flr.s.
-# Import with:  import "std"
+# std.fl — Falcon Standard Library, x86-32 Linux
 #
-# A real std.fl is imported as normal Falcon source. Link flr.o if you call
-# these _flr_* runtime wrappers. If no std.fl is found, the compiler falls back
-# to its virtual built-in std and enables runtime-backed print().
+# The real-file version of the built-in `std`: the same names with the same
+# behaviour, so a program compiles the same way with either one.
+#   import "std"      (needs flr.o linked in; use  -I.  to find this file)
 #
-# Available functions (mostly thin wrappers over _flr_* symbols):
+# Not defined here because the compiler provides them (and they also work with
+# this file): len(array), str_concat(a, b), str_format(fmt, ...).
+#
+# Printing:      print(x)  print_var(x)    any type, followed by a newline
+#                                           (int/long/bool/ptr as numbers, str as text,
+#                                            float/double with 6 decimals)
+# Input:         read_line()  read_int()  input(prompt) -> int  input_str(prompt) -> str
+#                stdin_eof()
+# Runtime:       every _flr_* function of flr.o can be called directly.
 
-# ── I/O ──────────────────────────────────────────────────────────────
+# ── the built-in std ──────────────────────────────────────────────────
 
-func print_str(s: str) -> void {
-    # Explicit string output wrapper. Runtime-backed print() is only magic when
-    # the virtual built-in std is used.
-    __syscall(4, 1, s, str_len(s))  # sys_write fd=1 buf=s len
+func print(v: generic) -> void {
+    __print(v)
 }
 
-func print(s: str) -> void {
-    print_str(s)
-    __syscall(4, 1, "\n", 1)
+func print_var(v: generic) -> void {
+    __print(v)
 }
-
-func print_int(n: int) -> void {
-    # Explicit integer output wrapper. Runtime-backed print() is only magic when
-    # the virtual built-in std is used.
-    __syscall(4, 1, int_to_str(n), str_len(int_to_str(n)))
-}
-
-func print_var(s: generic) -> void {
-    # Prints any value followed by a newline, picking the printer from its type:
-    # int/long/bool/ptr as numbers, str as text, float/double with 6 decimals.
-    # `generic` makes this a template: one concrete copy per argument type used.
-    __print(s)
-}
-
-# ── Input (stdin) ─────────────────────────────────────────────────────
 
 func read_line() -> str {
-    # Reads one line from stdin (fd 0) into a fresh heap string. The trailing
-    # "\n" (and a "\r" before it) is stripped. Lines of any length work.
-    # At end of input it returns "" and stdin_eof() becomes 1.
+    # One line from stdin, "\n" / "\r\n" stripped. "" at end of input.
     return _flr_read_line()
 }
 
 func stdin_eof() -> int {
-    # 1 if the most recent read_line() hit end of input without reading any
-    # data, else 0. A final line with no trailing newline is returned normally
-    # (stdin_eof() stays 0); the next read_line() then reports EOF.
+    # 1 if the last read_line() hit end of input without reading any data.
     return _flr_stdin_eof()
 }
 
 func input_str(prompt: str) -> str {
-    # Prints prompt (no newline), then returns the next line of stdin.
-    print_str(prompt)
-    return read_line()
+    # Prints prompt (no newline), then returns the next line.
+    return _flr_input_str(prompt)
 }
 
 func read_int() -> int {
-    # Reads a line and parses it as a decimal int (optional leading '-').
-    # Parsing stops at the first non-digit, so "12abc" -> 12 and "abc" -> 0.
-    return str_to_int(read_line())
+    # Parsing stops at the first non-digit: "12abc" -> 12, "abc" -> 0.
+    return _flr_str_to_int(_flr_read_line())
 }
 
 func input(prompt: str) -> int {
-    # Prints prompt (no newline), reads a line, and returns it as an int.
-    print_str(prompt)
-    return read_int()
+    # Prints prompt (no newline), reads a line and returns it as an int.
+    return _flr_str_to_int(_flr_input_str(prompt))
 }
 
-# ── String utilities ──────────────────────────────────────────────────
+# ── convenience wrappers (not part of the built-in std) ──────────────
+
+func print_str(s: str) -> void {
+    __syscall(4, 1, s, _flr_str_len(s))   # no newline
+}
+
+func print_int(n: int) -> void {
+    print_str(_flr_int_to_str(n))                  # no newline
+}
 
 func str_len(s: str) -> int {
     return _flr_str_len(s)
@@ -86,8 +75,6 @@ func str_to_int(s: str) -> int {
     return _flr_str_to_int(s)
 }
 
-# ── Math ──────────────────────────────────────────────────────────────
-
 func abs(n: int) -> int {
     return _flr_abs(n)
 }
@@ -100,26 +87,21 @@ func max(a: int, b: int) -> int {
     return _flr_max(a, b)
 }
 
-# ── Memory ────────────────────────────────────────────────────────────
-
 func alloc(size: int) -> int {
-    # Returns a pointer (int) to size bytes of zero-initialised heap memory.
-    # Uses the 1 MB bump allocator in flr.o; there is no free().
+    # Zero-initialised heap memory (bump allocator).
     return _flr_alloc(size)
 }
 
 func free(ptr: int) -> void {
-    # No-op in the bump allocator. Provided so code is portable.
+    # No-op in the bump allocator; for portability.
     _flr_free(ptr)
 }
-
-# ── Control ───────────────────────────────────────────────────────────
 
 func exit(code: int) -> void {
     _flr_exit(code)
 }
 
 func assert(cond: int, msg: str) -> void {
-    # If cond == 0 prints "assertion failed: <msg>" to stderr and exits(1).
+    # If cond == 0 prints "assertion failed: <msg>" to stderr and exits with 1.
     _flr_assert(cond, msg)
 }

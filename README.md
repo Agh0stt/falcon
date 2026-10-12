@@ -538,6 +538,69 @@ Two type keywords:
 
 `print_var(x)` (in `std.fl`, `std64.fl`, and built into the virtual `std`) prints any value plus a newline by its type: int/long/bool/pointers as numbers, `str` as text, float/double with 6 decimals. It is a generic function over the `__print(x)` intrinsic, which works with the real std files too (they link `flr.o` / `flrt64.o`). The built-in `print` in the virtual `std` is unchanged.
 
+### Libraries: `strings.fl` and `io.fl`
+
+Two optional libraries, each a single file that works on both `x86-32-linux` and `x86-64-linux` (they hold addresses in `long` and pick syscall numbers with `__arch()`). Import them next to a std, with `-I.` pointing at the repo:
+
+```
+import "std"        # or "std64"
+import "strings"
+import "io"
+```
+
+They only need the runtime (`_flr_alloc`, `_flr_str_len`), so they work with the built-in std, `std.fl` + `flr.o`, or `std64.fl` + `flrt64.o`.
+
+**`strings.fl`** — all functions return fresh heap strings and never modify their arguments; indexes are 0-based; bad indexes are clamped or give `0` / `-1`.
+
+| Function | Description |
+|----------|-------------|
+| `str_at(s, i) -> int` | Byte at `i` (0 if out of range) |
+| `str_sub(s, start, n) -> str` | Up to `n` bytes from `start` |
+| `str_find(s, needle)` / `str_find_from(s, needle, from)` | First index, or `-1` |
+| `str_contains`, `str_starts_with`, `str_ends_with` | `1` / `0` |
+| `str_count(s, needle)` | Non-overlapping matches |
+| `str_replace(s, old, new)` | Replace every non-overlapping `old` |
+| `str_trim`, `str_ltrim`, `str_rtrim` | Strip space, `\t`, `\r`, `\n` |
+| `str_upper`, `str_lower` | ASCII case conversion |
+| `str_repeat(s, n)`, `str_reverse(s)` | |
+| `str_cmp(a, b)` | `-1`, `0` or `1` by byte order |
+| `str_from_char(c)` | One-byte string |
+| `str_split_count(s, sep)`, `str_split_get(s, sep, i)` | Number of parts / the i-th part |
+| `char_is_digit`, `char_is_alpha`, `char_is_alnum`, `char_is_space` | `1` / `0` |
+
+**`io.fl`** — files are `int` file descriptors (`0`, `1`, `2` are stdin/stdout/stderr). Failures return a **negative errno** (for example `-2` = no such file). Strings are NUL-terminated, so the text helpers are for text files.
+
+| Function | Description |
+|----------|-------------|
+| `fio_open(path, mode) -> int` | `"r"` `"w"` `"a"` `"r+"` `"w+"` `"a+"` as in C; fd or `-errno` |
+| `fio_close(fd)` | |
+| `fio_write(fd, s)`, `fio_write_line(fd, s)` | Bytes written, or `-errno` |
+| `fio_read(fd, n)` | Up to `n` bytes (`""` at end of file) |
+| `fio_read_line(fd)` / `fio_eof()` | One line, `\n` / `\r\n` stripped; `fio_eof()` is 1 after a read that hit EOF with no data |
+| `fio_read_all(fd)`, `fio_read_file(path)` | Whole file |
+| `fio_write_file(path, s)`, `fio_append_file(path, s)` | Create/overwrite, or append |
+| `fio_exists(path)`, `fio_size(path)` | `1`/`0`, size or `-errno` |
+| `fio_seek(fd, offset, whence)` | whence `0` start, `1` current, `2` end |
+| `fio_remove`, `fio_rename`, `fio_mkdir`, `fio_rmdir` | `0` or `-errno` |
+| `fio_error()` | Last `fio_open` failure (negative errno) |
+
+```
+import "std"
+import "io"
+import "strings"
+func main() -> void {
+    text: str = fio_read_file("notes.txt")
+    print_var(str_count(text, "\n"))
+    fio_write_file("out.txt", str_upper(text))
+}
+```
+
+### The real `std.fl` / `std64.fl` match the built-in std
+
+`std.fl` (32-bit) and `std64.fl` (64-bit) were rewritten to mirror the built-in `import "std"`: the same names and the same behaviour, so a program compiles the same way with either. `print(x)` and `print_var(x)` take any type (they are `generic` functions over `__print`), and `read_line`, `read_int`, `input`, `input_str` and `stdin_eof` are the same too. `len(array)`, `str_concat(a, b)` and `str_format(fmt, ...)` are compiler builtins that now also work with the real files (a function you define yourself with one of those names still wins). `flr.s` therefore also carries `_flr_str_concat` and `_flr_str_format`, and `len` now works on `x86-64-linux` as well.
+
+The real files additionally keep a few convenience wrappers that the built-in std does not have: `print_str`, `print_int` (no newline), `str_len`, `str_eq`, `int_to_str`, `str_to_int`, `abs`, `min`, `max`, `alloc`, `free`, `exit`, `assert`. They are in a separate section at the bottom of each file. `lib/` and `rt/` hold copies of the libraries and runtimes; keep them in sync with the root files.
+
 ---
 
 ## Hardware intrinsics
@@ -559,6 +622,7 @@ These are built into the compiler and emit a single instruction or a short inlin
 | `__pokeb(addr, val)` | Write a byte to memory |
 | `__memset(ptr, val, n)` | Fill `n` bytes with `val` |
 | `__memcpy(dst, src, n)` | Copy `n` bytes |
+| `__arch()` | Target word size as a constant: `32` or `64` (lets one library pick per-target syscall numbers) |
 
 ---
 
