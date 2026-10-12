@@ -726,9 +726,12 @@ done
 
 ## Known limitations
 
-- **No binary literals.** Use decimal or `0x` hex instead.
-- **Structs need manual allocation.** Declare `p: MyStruct = _flr_alloc(nfields * 4)` before writing fields (32-bit: 4 bytes/field; 64-bit: 8 bytes/field).
+- **Structs need manual allocation.** Declare `p: MyStruct = _flr_alloc(...)` before writing fields. Fields are 4 bytes each on 32-bit, except `long` and `double`, which take 8. On 64-bit every field is 8 bytes.
+- **No bounds checking.** Indexing past the end of an array reads or writes whatever is in memory. `len(arr)` is available for manual checks.
+- **Integer division by zero crashes.** It raises SIGFPE (exit status 136) rather than a Falcon error.
+- **`int` does not wrap at 32 bits on `x86-64-linux`.** Values are computed in full 64-bit registers, so `1 << 31` is `2147483648` on 64-bit but `-2147483648` on 32-bit. This is intentional: `int` also holds heap addresses, and truncating it would break pointer arithmetic. Fixing it properly needs a separate pointer type.
+- **String literals are limited to 16,384 bytes.** The lexer uses a fixed buffer.
 - **`int_to_str` uses a static buffer.** The returned pointer is overwritten on the next call.
-- **No closures, generics, or modules beyond import.**
-- **`str_format` output is capped at 512 bytes.**
-- **No free.** The bump allocator never reclaims memory.
+- **`str_format` output is capped at 512 bytes**, with at most 8 arguments.
+- **No free.** The bump allocator never reclaims memory, and `_flr_free` is a no-op.
+- **No closures, first-class functions, or modules beyond `import`.** `generic` parameters give compile-time templates, but a variable's type is always fixed at compile time.
