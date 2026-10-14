@@ -1,0 +1,45 @@
+# REALSTD: 64
+# STDOUT: 11|81|str|1|100|100|9|0|100|126|0|1|0|99|seven|99
+import "std64"
+import "collections"
+func main() -> void {
+    v: long = vec_new()
+    i: int = 0
+    while (i < 10) {
+        vec_push(v, i * i)
+        i += 1
+    }
+    vec_push(v, "str")
+    print(vec_len(v))
+    print(vec_get(v, 9))
+    s: str = vec_get(v, 10)
+    print(s)
+    print(vec_pop(v) != 0)
+    vec_insert(v, 0, 100)
+    print(vec_get(v, 0))
+    print(vec_remove(v, 0))
+    print(vec_get(v, 3))
+    print(vec_get(v, 99))
+    m: long = map_new()
+    j: int = 0
+    while (j < 100) {
+        map_set(m, str_format("k%d", j), j * 3)
+        j += 1
+    }
+    print(map_len(m))
+    print(map_get(m, "k42"))
+    print(map_has(m, "nope"))
+    print(map_remove(m, "k42"))
+    print(map_has(m, "k42"))
+    print(map_len(m))
+    map_set(m, "k7", "seven")
+    t: str = map_get(m, "k7")
+    print(t)
+    total: long = 0
+    it: int = map_next(m, 0)
+    while (it >= 0) {
+        total += 1
+        it = map_next(m, it + 1)
+    }
+    print(total)
+}

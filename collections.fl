@@ -1,0 +1,358 @@
+# collections.fl — growable arrays (vec) and hash maps (map) for Falcon
+# Works on x86-32-linux and x86-64-linux, with the built-in std or a real std.fl/std64.fl.
+#
+#   import "std"           # or "std64"
+#   import "collections"
+#   falconc prog.fl -I. -o prog.s
+#
+# A vec or map is a `long` handle to a heap block, so the handle stays valid while
+# the collection grows: `vec_push(v, 5)` changes v in place (no `v = ...` needed).
+#
+# Elements and map values are 8-byte slots. They can be anything that fits a `long`:
+# int, long, bool, str or pointers. Reading returns `long`; assign it to the type you
+# stored:  s: str = vec_get(v, 0)   n: int = map_get(m, "a").  (float/double are not
+# supported: store them scaled, e.g. as to_long(x * 1000.0d).)
+#
+# Memory: growth copies into a bigger block and the old block is not freed (Falcon's
+# allocator is a bump allocator), so collections that grow a lot leave garbage behind.
+#
+# vec
+#   vec_new() -> long             vec_len(v) -> int          vec_cap(v) -> int
+#   vec_push(v, x)                vec_pop(v) -> long         (0 when empty)
+#   vec_get(v, i) -> long         (0 when out of range)      vec_set(v, i, x) -> int (1 ok / 0 out of range)
+#   vec_insert(v, i, x) -> int    vec_remove(v, i) -> long   (shift the rest)
+#   vec_clear(v)
+#
+# map  (keys are str, copied on insert; values are 8-byte slots)
+#   map_new() -> long             map_len(m) -> int
+#   map_set(m, key, val)          map_get(m, key) -> long    (0 when absent)
+#   map_has(m, key) -> int        map_remove(m, key) -> int  (1 removed / 0 absent)
+#   map_clear(m)
+#   iteration:  i: int = map_next(m, 0)
+#               while (i >= 0) { k: str = map_key_at(m, i)  v: long = map_val_at(m, i)
+#                                i = map_next(m, i + 1) }          (order is unspecified)
+
+func coll_ld(a: long) -> long {
+    lo: long = __peek(a)
+    lo = lo & 4294967295
+    hi: long = __peek(a + 4)
+    return lo | (hi << 32)
+}
+
+func coll_st(a: long, v: long) -> void {
+    __poke(a, to_int(v & 4294967295))
+    __poke(a + 4, to_int(v >> 32))
+}
+
+func coll_copy(dst: long, src: long, n: int) -> void {
+    i: int = 0
+    while (i < n) {
+        __pokeb(dst + i, __peekb(src + i))
+        i += 1
+    }
+}
+
+func coll_dup(s: str) -> long {
+    n: int = _flr_str_len(s)
+    p: long = _flr_alloc(n + 1)
+    coll_copy(p, s, n)
+    return p
+}
+
+# ── vec: header = [len:8][cap:8][data:8] ───────────────────────────────
+
+func vec_new() -> long {
+    h: long = _flr_alloc(24)
+    coll_st(h + 8, 4)
+    coll_st(h + 16, _flr_alloc(32))
+    return h
+}
+
+func vec_len(v: long) -> int {
+    return to_int(coll_ld(v))
+}
+
+func vec_cap(v: long) -> int {
+    return to_int(coll_ld(v + 8))
+}
+
+func vec_reserve(v: long, need: int) -> void {
+    cap: int = to_int(coll_ld(v + 8))
+    if (need <= cap) {
+        return
+    }
+    ncap: int = cap * 2
+    while (ncap < need) {
+        ncap = ncap * 2
+    }
+    old: long = coll_ld(v + 16)
+    nd: long = _flr_alloc(ncap * 8)
+    coll_copy(nd, old, to_int(coll_ld(v)) * 8)
+    coll_st(v + 16, nd)
+    coll_st(v + 8, ncap)
+}
+
+func vec_push(v: long, x: generic) -> void {
+    n: int = to_int(coll_ld(v))
+    vec_reserve(v, n + 1)
+    slot: long = x
+    coll_st(coll_ld(v + 16) + n * 8, slot)
+    coll_st(v, n + 1)
+}
+
+func vec_get(v: long, i: int) -> long {
+    if (i < 0 or i >= to_int(coll_ld(v))) {
+        return 0
+    }
+    return coll_ld(coll_ld(v + 16) + i * 8)
+}
+
+func vec_set(v: long, i: int, x: generic) -> int {
+    if (i < 0 or i >= to_int(coll_ld(v))) {
+        return 0
+    }
+    slot: long = x
+    coll_st(coll_ld(v + 16) + i * 8, slot)
+    return 1
+}
+
+func vec_pop(v: long) -> long {
+    n: int = to_int(coll_ld(v))
+    if (n == 0) {
+        return 0
+    }
+    r: long = coll_ld(coll_ld(v + 16) + (n - 1) * 8)
+    coll_st(v, n - 1)
+    return r
+}
+
+func vec_insert(v: long, i: int, x: generic) -> int {
+    n: int = to_int(coll_ld(v))
+    if (i < 0 or i > n) {
+        return 0
+    }
+    vec_reserve(v, n + 1)
+    d: long = coll_ld(v + 16)
+    j: int = n
+    while (j > i) {
+        coll_st(d + j * 8, coll_ld(d + (j - 1) * 8))
+        j -= 1
+    }
+    slot: long = x
+    coll_st(d + i * 8, slot)
+    coll_st(v, n + 1)
+    return 1
+}
+
+func vec_remove(v: long, i: int) -> long {
+    n: int = to_int(coll_ld(v))
+    if (i < 0 or i >= n) {
+        return 0
+    }
+    d: long = coll_ld(v + 16)
+    r: long = coll_ld(d + i * 8)
+    j: int = i
+    while (j < n - 1) {
+        coll_st(d + j * 8, coll_ld(d + (j + 1) * 8))
+        j += 1
+    }
+    coll_st(v, n - 1)
+    return r
+}
+
+func vec_clear(v: long) -> void {
+    coll_st(v, 0)
+}
+
+# ── map: header = [live:8][cap:8][keys:8][vals:8][tombstones:8] ────────
+# A key slot holds 0 (empty), 1 (deleted) or a pointer to the key's copy.
+
+func coll_hash(s: str) -> long {
+    p: long = s
+    h: long = 2166136261
+    i: int = 0
+    c: int = __peekb(p)
+    while (c != 0) {
+        h = (h ^ c) * 16777619
+        h = h & 4294967295
+        i += 1
+        c = __peekb(p + i)
+    }
+    return h
+}
+
+func map_new() -> long {
+    m: long = _flr_alloc(40)
+    coll_st(m + 8, 8)
+    coll_st(m + 16, _flr_alloc(64))
+    coll_st(m + 24, _flr_alloc(64))
+    return m
+}
+
+func map_len(m: long) -> int {
+    return to_int(coll_ld(m))
+}
+
+func map_find(m: long, key: str) -> int {
+    cap: int = to_int(coll_ld(m + 8))
+    keys: long = coll_ld(m + 16)
+    mask: int = cap - 1
+    i: int = to_int(coll_hash(key) & mask)
+    n: int = 0
+    while (n < cap) {
+        k: long = coll_ld(keys + i * 8)
+        if (k == 0) {
+            return -1
+        }
+        if (k != 1) {
+            ks: str = k
+            if (_flr_str_eq(ks, key) == 1) {
+                return i
+            }
+        }
+        i = (i + 1) & mask
+        n += 1
+    }
+    return -1
+}
+
+func coll_put_raw(keys: long, vals: long, cap: int, kp: long, val: long) -> void {
+    mask: int = cap - 1
+    ks: str = kp
+    i: int = to_int(coll_hash(ks) & mask)
+    while (coll_ld(keys + i * 8) != 0) {
+        i = (i + 1) & mask
+    }
+    coll_st(keys + i * 8, kp)
+    coll_st(vals + i * 8, val)
+}
+
+func map_grow(m: long) -> void {
+    cap: int = to_int(coll_ld(m + 8))
+    keys: long = coll_ld(m + 16)
+    vals: long = coll_ld(m + 24)
+    ncap: int = cap * 2
+    nk: long = _flr_alloc(ncap * 8)
+    nv: long = _flr_alloc(ncap * 8)
+    i: int = 0
+    while (i < cap) {
+        k: long = coll_ld(keys + i * 8)
+        if (k > 1) {
+            coll_put_raw(nk, nv, ncap, k, coll_ld(vals + i * 8))
+        }
+        i += 1
+    }
+    coll_st(m + 8, ncap)
+    coll_st(m + 16, nk)
+    coll_st(m + 24, nv)
+    coll_st(m + 32, 0)
+}
+
+func map_set(m: long, key: str, val: generic) -> void {
+    slot: long = val
+    at: int = map_find(m, key)
+    if (at >= 0) {
+        coll_st(coll_ld(m + 24) + at * 8, slot)
+        return
+    }
+    live: int = to_int(coll_ld(m))
+    tomb: int = to_int(coll_ld(m + 32))
+    cap: int = to_int(coll_ld(m + 8))
+    if ((live + tomb + 1) * 4 > cap * 3) {
+        map_grow(m)
+        cap = to_int(coll_ld(m + 8))
+        tomb = 0
+    }
+    keys: long = coll_ld(m + 16)
+    vals: long = coll_ld(m + 24)
+    mask: int = cap - 1
+    i: int = to_int(coll_hash(key) & mask)
+    reuse: int = -1
+    while (true) {
+        k: long = coll_ld(keys + i * 8)
+        if (k == 0) {
+            break
+        }
+        if (k == 1 and reuse < 0) {
+            reuse = i
+        }
+        i = (i + 1) & mask
+    }
+    if (reuse >= 0) {
+        i = reuse
+        tomb -= 1
+        coll_st(m + 32, tomb)
+    }
+    coll_st(keys + i * 8, coll_dup(key))
+    coll_st(vals + i * 8, slot)
+    coll_st(m, live + 1)
+}
+
+func map_get(m: long, key: str) -> long {
+    at: int = map_find(m, key)
+    if (at < 0) {
+        return 0
+    }
+    return coll_ld(coll_ld(m + 24) + at * 8)
+}
+
+func map_has(m: long, key: str) -> int {
+    if (map_find(m, key) >= 0) {
+        return 1
+    }
+    return 0
+}
+
+func map_remove(m: long, key: str) -> int {
+    at: int = map_find(m, key)
+    if (at < 0) {
+        return 0
+    }
+    coll_st(coll_ld(m + 16) + at * 8, 1)
+    coll_st(coll_ld(m + 24) + at * 8, 0)
+    coll_st(m, coll_ld(m) - 1)
+    coll_st(m + 32, coll_ld(m + 32) + 1)
+    return 1
+}
+
+func map_clear(m: long) -> void {
+    cap: int = to_int(coll_ld(m + 8))
+    keys: long = coll_ld(m + 16)
+    vals: long = coll_ld(m + 24)
+    i: int = 0
+    while (i < cap) {
+        coll_st(keys + i * 8, 0)
+        coll_st(vals + i * 8, 0)
+        i += 1
+    }
+    coll_st(m, 0)
+    coll_st(m + 32, 0)
+}
+
+func map_next(m: long, from: int) -> int {
+    cap: int = to_int(coll_ld(m + 8))
+    keys: long = coll_ld(m + 16)
+    i: int = from
+    if (i < 0) {
+        i = 0
+    }
+    while (i < cap) {
+        if (coll_ld(keys + i * 8) > 1) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+func map_key_at(m: long, i: int) -> str {
+    k: long = coll_ld(coll_ld(m + 16) + i * 8)
+    if (k <= 1) {
+        return ""
+    }
+    return k
+}
+
+func map_val_at(m: long, i: int) -> long {
+    return coll_ld(coll_ld(m + 24) + i * 8)
+}

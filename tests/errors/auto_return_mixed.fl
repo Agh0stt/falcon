@@ -1,0 +1,10 @@
+# ERROR: return type mismatch
+func maxof(a: generic, b: generic) -> auto {
+    if (a > b) {
+        return a
+    }
+    return b
+}
+func main() -> void {
+    x: auto = maxof(3, 2.5d)
+}

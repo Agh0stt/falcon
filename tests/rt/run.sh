@@ -7,6 +7,7 @@
 #   # STDOUT: a|b|c            ('|' = newline)
 #   # STDERR: text             (optional; compared exactly, 1 line)
 #   # STDIN: a|b|c            ('|' = newline, \\r etc. allowed; a trailing newline is added unless the value ends in '~')
+#   # ARGS: one two           (command-line arguments passed to the program)
 #   # LIBS: 1                (make io.fl / strings.fl importable while keeping the built-in std)
 #   # REALSTD: 32 | 64        (compile against the real std.fl / std64.fl via -I; forces that ARCH and links flr.o / flrt64.o)
 F=${F:-.}
@@ -21,7 +22,8 @@ for f in $(ls $D/*.fl | sort); do
   want_err=$(sed -n 's/^# STDERR: //p' $f | head -1)
   has_in=$(grep -c '^# STDIN: ' $f); in_raw=$(sed -n 's/^# STDIN: //p' $f | head -1)
   libs=$(sed -n 's/^# LIBS: //p' $f | head -1)
-  realstd=$(sed -n 's/^# REALSTD: //p' $f | head -1); inc=""; rt64="" ; if [ -n "$realstd" ]; then inc="-I$F"; [ "$realstd" = 1 ] && realstd=32; archs=$realstd; [ "$realstd" = 64 ] && rt64="$F/flrt64.o"; elif [ -n "$libs" ]; then mkdir -p $W/libs; cp $F/io.fl $F/strings.fl $W/libs/; inc="-I$W/libs"; fi
+  prog_args=$(sed -n 's/^# ARGS: //p' $f | head -1)
+  realstd=$(sed -n 's/^# REALSTD: //p' $f | head -1); inc=""; rt64="" ; if [ -n "$realstd" ]; then inc="-I$F"; [ "$realstd" = 1 ] && realstd=32; archs=$realstd; [ "$realstd" = 64 ] && rt64="$F/flrt64.o"; elif [ -n "$libs" ]; then mkdir -p $W/libs; cp $F/io.fl $F/strings.fl $F/collections.fl $W/libs/; inc="-I$W/libs"; fi
   if [ "${in_raw: -1}" = "~" ]; then printf '%b' "${in_raw%\~}" | tr '|' '\n' > $W/$b.in; else printf '%b\n' "$in_raw" | tr '|' '\n' > $W/$b.in; fi
   [ "$has_in" = 0 ] && : > $W/$b.in
   for arch in 32 64; do
@@ -32,7 +34,7 @@ for f in $(ls $D/*.fl | sort); do
       $F/falconc $f $inc -arch x86-64-linux -o $W/$b.$arch.s 2>$W/$b.$arch.err && as $W/$b.$arch.s -o $W/$b.$arch.o 2>>$W/$b.$arch.err && ld $rt64 $W/$b.$arch.o -o $W/$b.$arch 2>>$W/$b.$arch.err
     fi
     if [ $? -ne 0 ]; then echo "FAIL $b [$arch] (build)"; fail=$((fail+1)); continue; fi
-    got_out=$(timeout 10 $W/$b.$arch <$W/$b.in 2>$W/$b.$arch.stderr); rc=$?
+    got_out=$(timeout 10 $W/$b.$arch $prog_args <$W/$b.in 2>$W/$b.$arch.stderr); rc=$?
     got_err=$(cat $W/$b.$arch.stderr)
     ok=1
     [ "$got_out" == "$want_out" ] || ok=0

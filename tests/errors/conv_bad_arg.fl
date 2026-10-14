@@ -1,0 +1,5 @@
+# ERROR: expects a number
+import "std"
+func main() -> void {
+    x: int = to_int("s")
+}

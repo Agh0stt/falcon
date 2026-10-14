@@ -1,0 +1,6 @@
+# ERROR: needs at least one `generic` parameter
+func f(a: int) -> auto {
+    return a
+}
+func main() -> void {
+}

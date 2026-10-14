@@ -1,0 +1,12 @@
+# REALSTD: 64
+# ARGS: one two
+# STDOUT: 3|one|two|||1
+import "std64"
+func main() -> void {
+    print(arg_count())
+    print(arg_get(1))
+    print(arg_get(2))
+    print(arg_get(3))
+    print(arg_get(0 - 1))
+    print(_flr_str_len(arg_get(0)) > 0)
+}

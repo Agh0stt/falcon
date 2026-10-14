@@ -524,7 +524,7 @@ Two type keywords:
   n = 2.5d              # error: cannot assign double to int
   ```
 
-  `auto` is not allowed for globals, parameters, return types or struct fields.
+  `auto` is not allowed for globals, parameters or struct fields. As a return type, `-> auto` is only allowed on functions that have a `generic` parameter (see below).
 
 - **`generic`** is a *parameter* type that accepts a value of any type. The function becomes a template: each distinct combination of argument types gets its own concrete, file-local copy at compile time (no runtime cost, no boxing), so the body is checked with the real types.
 
@@ -600,6 +600,50 @@ func main() -> void {
 `std.fl` (32-bit) and `std64.fl` (64-bit) were rewritten to mirror the built-in `import "std"`: the same names and the same behaviour, so a program compiles the same way with either. `print(x)` and `print_var(x)` take any type (they are `generic` functions over `__print`), and `read_line`, `read_int`, `input`, `input_str` and `stdin_eof` are the same too. `len(array)`, `str_concat(a, b)` and `str_format(fmt, ...)` are compiler builtins that now also work with the real files (a function you define yourself with one of those names still wins). `flr.s` therefore also carries `_flr_str_concat` and `_flr_str_format`, and `len` now works on `x86-64-linux` as well.
 
 The real files additionally keep a few convenience wrappers that the built-in std does not have: `print_str`, `print_int` (no newline), `str_len`, `str_eq`, `int_to_str`, `str_to_int`, `abs`, `min`, `max`, `alloc`, `free`, `exit`, `assert`. They are in a separate section at the bottom of each file. `lib/` and `rt/` hold copies of the libraries and runtimes; keep them in sync with the root files.
+
+### Number conversions, `str_to_float`, `-> auto` and argv
+
+**Explicit conversions** (built into the compiler, so they also work with the real `std.fl`). Float to int truncates toward zero. Implicit float-to-int assignment is still an error; use these instead:
+
+| Function | Result |
+|----------|--------|
+| `to_int(x)`, `to_long(x)` | `x` as int / long (`to_int(2.7d)` is `2`, `to_int(0.0d - 2.7d)` is `-2`) |
+| `to_float(x)`, `to_double(x)` | `x` as float / double |
+
+`x` may be an int, long, float, double or bool.
+
+**Parsing decimals.** `str_to_double(s)` and `str_to_float(s)` read an optional sign, digits, an optional fraction and an optional exponent (`"  -12.5e1"` is `-125.0`). Text with no digits gives `0.0`. For stdin there are `read_double()`, `read_float()`, `input_double(prompt)` and `input_float(prompt)`. These are written in Falcon and compiled into your program only when you call them, so they work with the built-in std, `std.fl` and `std64.fl` alike (unless you define a function of the same name).
+
+**Command-line arguments.** `arg_count()` returns the number of arguments including the program name, and `arg_get(i)` returns argument `i` (`arg_get(0)` is the program, `""` if out of range). They read `/proc/self/cmdline`, work on both targets, and need no changes to `std`.
+
+**`-> auto` for generic functions.** A function with a `generic` parameter may declare `-> auto`; the return type is inferred from its first `return value` for each copy of the function:
+
+```
+func maxof(a: generic, b: generic) -> auto {
+    if (a > b) { return a }
+    return b
+}
+m: auto = maxof(3, 9)        # int
+d: auto = maxof(2.5d, 1.5d)  # double
+```
+
+A copy with no `return value` is void. All returns of one copy must have the same type, so `maxof(3, 2.5d)` is an error. A recursive call before the first `return value` cannot infer a type and is an error. `-> auto` on a function with no `generic` parameter is an error (name the type).
+
+### `collections.fl`: growable arrays and maps
+
+`import "collections"` (next to a std, with `-I.`). A vec or map is a `long` handle, so it keeps working while it grows: `vec_push(v, 5)` changes `v` in place. Elements and map values are 8-byte slots (int, long, bool, str or pointer); read them back as `long` and assign to the type you stored (`s: str = vec_get(v, 0)`). float/double values are not supported (store them scaled). Growth leaves the old block behind because Falcon's allocator is a bump allocator that never frees.
+
+| Function | Description |
+|----------|-------------|
+| `vec_new()`, `vec_len(v)`, `vec_cap(v)` | Create / length / capacity |
+| `vec_push(v, x)`, `vec_pop(v)` | Append / remove last (`0` if empty) |
+| `vec_get(v, i)`, `vec_set(v, i, x)` | Out of range gives `0` / returns `0` |
+| `vec_insert(v, i, x)`, `vec_remove(v, i)` | Shift the rest |
+| `vec_clear(v)` | |
+| `map_new()`, `map_len(m)` | Create / number of keys |
+| `map_set(m, key, val)`, `map_get(m, key)` | `str` keys (copied); `0` when absent |
+| `map_has(m, key)`, `map_remove(m, key)`, `map_clear(m)` | |
+| `map_next(m, i)`, `map_key_at(m, i)`, `map_val_at(m, i)` | Iterate: start with `map_next(m, 0)`, stop at `-1`; order is unspecified |
 
 ---
 

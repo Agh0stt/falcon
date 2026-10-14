@@ -1,0 +1,28 @@
+# STDOUT: 9|2.500000|11|42|2.500000|<1>|void result ok|5
+import "std"
+func maxof(a: generic, b: generic) -> auto {
+    if (a > b) {
+        return a
+    }
+    return b
+}
+func twice(x: generic) -> auto {
+    return x + x
+}
+func describe(x: generic) -> auto {
+    return str_concat("<", str_concat(str_format("%d", 1), ">"))
+}
+func nothing(x: generic) -> auto {
+    print(x)
+}
+func main() -> void {
+    print(maxof(3, 9))
+    print(maxof(2.5d, 1.5d))
+    m: auto = maxof(10, 4)
+    print(m + 1)
+    print(twice(21))
+    print(twice(1.25d))
+    print(describe(0))
+    nothing("void result ok")
+    print(to_int(twice(2.5d)))
+}

@@ -539,6 +539,7 @@ struct Node{
     char *callee;NList args;
     NList elems;
     char *import_path;char *name;
+    int tc_done;    /* N_FUNC already type-checked (instances whose return type is inferred) */
     int is_generic; /* N_FUNC with `generic` parameters: a template, instantiated per call-site argument types */
 };
 
@@ -1243,6 +1244,7 @@ static int has_any_param(PList *p){
     return 0;
 }
 static FuncSig *instantiate_generic(Node *call);
+static void tc_function(Node *n);
 
 /* return type of a builtin/runtime call; NULL means "not a known builtin" */
 static TypeRef *builtin_rettype(const char *name){
@@ -1364,22 +1366,242 @@ static FuncSig *instantiate_generic(Node *call){
     if(ex)return ex;
     Node *c=clone_node(tm);
     c->fname=xstrdup(name);c->is_generic=0;c->is_static=1;
+    int infer=(tm->rettype&&tm->rettype->kind==TY_AUTO);
+    if(infer)c->rettype=mktype(TY_AUTO,NULL,NULL);   /* own object: filled in by the first return */
     for(int i=0;i<c->params.n;i++)
         if(c->params.d[i].type&&c->params.d[i].type->kind==TY_ANY)
             c->params.d[i].type=call->args.d[i]->etype;
     if(nfsigs>=1024)die("too many functions");
     fsigs[nfsigs].name=xstrdup(name);fsigs[nfsigs].rettype=c->rettype;fsigs[nfsigs].params=c->params;
     nfsigs++;
+    FuncSig *isig=&fsigs[nfsigs-1];
     nl_push(&tc_prog->body,c);   /* type-checked and emitted like any other function */
-    return &fsigs[nfsigs-1];
+    if(infer)tc_function(c);      /* the caller needs the inferred return type right now */
+    return isig;
 }
 
 /* len / str_concat / str_format are compiler builtins that also work with a real std.fl
    (which cannot express them: len reads the array header, str_format is variadic).
    A user-defined function of the same name takes priority. */
+/* to_int / to_long / to_float / to_double: explicit numeric conversion (float -> int truncates toward zero) */
+static int conv_kind(const char *c){
+    if(!strcmp(c,"to_int"))return TY_INT;
+    if(!strcmp(c,"to_long"))return TY_LONG;
+    if(!strcmp(c,"to_float"))return TY_FLOAT;
+    if(!strcmp(c,"to_double"))return TY_DOUBLE;
+    return -1;
+}
 static int std_builtin_always(const char *c){
-    if(strcmp(c,"len")&&strcmp(c,"str_concat")&&strcmp(c,"str_format"))return 0;
+    if(strcmp(c,"len")&&strcmp(c,"str_concat")&&strcmp(c,"str_format")&&conv_kind(c)<0)return 0;
     return find_func(c)==NULL;
+}
+
+/* ── lazy prelude ────────────────────────────────────────────────────────
+   A few library functions are written in Falcon itself and compiled into the program only
+   when it calls them (and has not defined a function of that name). They are file-local, so
+   they work with the built-in std and with a real std.fl alike. */
+typedef struct{const char *name;const char *src;}PreludeFn;
+static const PreludeFn prelude_fns[]={
+    {"str_to_double",
+        "func str_to_double(s: str) -> double {\n"
+        "    p: long = s\n"
+        "    i: int = 0\n"
+        "    neg: int = 0\n"
+        "    while (__peekb(p + i) == 32 or __peekb(p + i) == 9) {\n"
+        "        i += 1\n"
+        "    }\n"
+        "    c: int = __peekb(p + i)\n"
+        "    if (c == 45) {\n"
+        "        neg = 1\n"
+        "        i += 1\n"
+        "    } else {\n"
+        "        if (c == 43) {\n"
+        "            i += 1\n"
+        "        }\n"
+        "    }\n"
+        "    v: double = 0.0d\n"
+        "    digits: int = 0\n"
+        "    fd: int = 0\n"
+        "    c = __peekb(p + i)\n"
+        "    while (c >= 48 and c <= 57) {\n"
+        "        v = v * 10.0d + (c - 48)\n"
+        "        digits += 1\n"
+        "        i += 1\n"
+        "        c = __peekb(p + i)\n"
+        "    }\n"
+        "    if (c == 46) {\n"
+        "        i += 1\n"
+        "        c = __peekb(p + i)\n"
+        "        while (c >= 48 and c <= 57) {\n"
+        "            v = v * 10.0d + (c - 48)\n"
+        "            fd += 1\n"
+        "            digits += 1\n"
+        "            i += 1\n"
+        "            c = __peekb(p + i)\n"
+        "        }\n"
+        "    }\n"
+        "    if (digits == 0) {\n"
+        "        return 0.0d\n"
+        "    }\n"
+        "    ex: int = 0\n"
+        "    if (c == 101 or c == 69) {\n"
+        "        i += 1\n"
+        "        eneg: int = 0\n"
+        "        c = __peekb(p + i)\n"
+        "        if (c == 45) {\n"
+        "            eneg = 1\n"
+        "            i += 1\n"
+        "        } else {\n"
+        "            if (c == 43) {\n"
+        "                i += 1\n"
+        "            }\n"
+        "        }\n"
+        "        c = __peekb(p + i)\n"
+        "        while (c >= 48 and c <= 57) {\n"
+        "            ex = ex * 10 + (c - 48)\n"
+        "            i += 1\n"
+        "            c = __peekb(p + i)\n"
+        "        }\n"
+        "        if (eneg == 1) {\n"
+        "            ex = 0 - ex\n"
+        "        }\n"
+        "    }\n"
+        "    ex = ex - fd\n"
+        "    scale: double = 1.0d\n"
+        "    while (ex > 0) {\n"
+        "        scale = scale * 10.0d\n"
+        "        ex -= 1\n"
+        "    }\n"
+        "    if (scale > 1.0d) {\n"
+        "        v = v * scale\n"
+        "    }\n"
+        "    scale = 1.0d\n"
+        "    while (ex < 0) {\n"
+        "        scale = scale * 10.0d\n"
+        "        ex += 1\n"
+        "    }\n"
+        "    if (scale > 1.0d) {\n"
+        "        v = v / scale\n"
+        "    }\n"
+        "    if (neg == 1) {\n"
+        "        v = 0.0d - v\n"
+        "    }\n"
+        "    return v\n"
+        "}\n"},
+    {"str_to_float",
+        "func str_to_float(s: str) -> float {\n"
+        "    return to_float(str_to_double(s))\n"
+        "}\n"},
+    {"read_double",
+        "func read_double() -> double {\n"
+        "    return str_to_double(read_line())\n"
+        "}\n"},
+    {"read_float",
+        "func read_float() -> float {\n"
+        "    return to_float(str_to_double(read_line()))\n"
+        "}\n"},
+    {"input_double",
+        "func input_double(prompt: str) -> double {\n"
+        "    return str_to_double(input_str(prompt))\n"
+        "}\n"},
+    {"input_float",
+        "func input_float(prompt: str) -> float {\n"
+        "    return to_float(str_to_double(input_str(prompt)))\n"
+        "}\n"},
+    {"arg_data",
+        "func arg_data() -> long {\n"
+        "    static cache: long = 0\n"
+        "    if (cache == 0) {\n"
+        "        nr_open: int = 5\n"
+        "        nr_read: int = 3\n"
+        "        nr_close: int = 6\n"
+        "        if (__arch() == 64) {\n"
+        "            nr_open = 2\n"
+        "            nr_read = 0\n"
+        "            nr_close = 3\n"
+        "        }\n"
+        "        buf: long = _flr_alloc(65544)\n"
+        "        n: int = 0\n"
+        "        fd: int = __syscall(nr_open, \"/proc/self/cmdline\", 0, 0)\n"
+        "        if (fd >= 0) {\n"
+        "            while (n < 65536) {\n"
+        "                r: int = __syscall(nr_read, fd, buf + 8 + n, 65536 - n)\n"
+        "                if (r == -4) {\n"
+        "                    continue\n"
+        "                }\n"
+        "                if (r <= 0) {\n"
+        "                    break\n"
+        "                }\n"
+        "                n += r\n"
+        "            }\n"
+        "            __syscall(nr_close, fd, 0, 0)\n"
+        "        }\n"
+        "        __poke(buf, n)\n"
+        "        cache = buf\n"
+        "    }\n"
+        "    return cache\n"
+        "}\n"},
+    {"arg_count",
+        "func arg_count() -> int {\n"
+        "    d: long = arg_data()\n"
+        "    n: int = __peek(d)\n"
+        "    c: int = 0\n"
+        "    i: int = 0\n"
+        "    while (i < n) {\n"
+        "        if (__peekb(d + 8 + i) == 0) {\n"
+        "            c += 1\n"
+        "        }\n"
+        "        i += 1\n"
+        "    }\n"
+        "    return c\n"
+        "}\n"},
+    {"arg_get",
+        "func arg_get(idx: int) -> str {\n"
+        "    d: long = arg_data()\n"
+        "    n: int = __peek(d)\n"
+        "    if (idx < 0) {\n"
+        "        return \"\"\n"
+        "    }\n"
+        "    start: int = 0\n"
+        "    k: int = 0\n"
+        "    i: int = 0\n"
+        "    while (i < n) {\n"
+        "        if (__peekb(d + 8 + i) == 0) {\n"
+        "            if (k == idx) {\n"
+        "                return d + 8 + start\n"
+        "            }\n"
+        "            k += 1\n"
+        "            start = i + 1\n"
+        "        }\n"
+        "        i += 1\n"
+        "    }\n"
+        "    return \"\"\n"
+        "}\n"},
+    {NULL,NULL}
+};
+static FuncSig *load_prelude(const char *name){
+    for(int k=0;prelude_fns[k].name;k++){
+        if(strcmp(prelude_fns[k].name,name))continue;
+        if(find_func(name))return find_func(name);
+        int save_pos=gpos,save_n=gntoks,start=gntoks;
+        tokenize(prelude_fns[k].src,"<prelude>");
+        emit_tok(TT_EOF,"",0,"<prelude>");
+        gpos=start;
+        Node *p=parse_program();
+        gpos=save_pos;gntoks=save_n;
+        for(int j=0;j<p->body.n;j++){
+            Node *f=p->body.d[j];
+            if(f->kind!=N_FUNC)die("internal error: prelude entry '%s' must be a single function",name);
+            f->is_static=1;
+            if(has_any_param(&f->params))f->is_generic=1;
+            if(nfsigs>=1024)die("too many functions");
+            fsigs[nfsigs].name=xstrdup(f->fname);fsigs[nfsigs].rettype=f->rettype;fsigs[nfsigs].params=f->params;
+            nfsigs++;
+            nl_push(&tc_prog->body,f);
+        }
+        return find_func(name);
+    }
+    return NULL;
 }
 
 static TypeRef *tc_expr(Node *n,TypeRef *ret){
@@ -1458,6 +1680,15 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
                 n->etype=builtin_rettype(n->callee);break;
             }
         }
+        /* explicit numeric conversions */
+        if(conv_kind(n->callee)>=0&&std_builtin_always(n->callee)){
+            if(n->args.n!=1)die("%s:%d: %s takes 1 argument",n->file,n->line,n->callee);
+            TypeRef *at=n->args.d[0]->etype;
+            if(!at||!(at->kind==TY_INT||at->kind==TY_LONG||at->kind==TY_FLOAT||at->kind==TY_DOUBLE||at->kind==TY_BOOL))
+                die("%s:%d: %s expects a number (int, long, float, double or bool), got %s",
+                    n->file,n->line,n->callee,at?type_name(at):"nothing");
+            n->etype=mktype(conv_kind(n->callee),NULL,NULL);break;
+        }
         /* str_concat(a:str, b:str) -> str */
         if(strcmp(n->callee,"str_concat")==0){
             if(n->args.n!=2)die("%s:%d: str_concat takes 2 arguments",n->file,n->line);
@@ -1478,6 +1709,7 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
         TypeRef *brt=builtin_rettype(n->callee);
         if(brt){n->etype=brt;break;}
         /* user-defined functions */
+        if(!find_func(n->callee))load_prelude(n->callee);   /* str_to_double, arg_get, ... on demand */
         FuncSig *sig=find_func(n->callee);
         if(sig&&has_any_param(&sig->params)){
             if(n->args.n!=sig->params.n)
@@ -1486,6 +1718,9 @@ static TypeRef *tc_expr(Node *n,TypeRef *ret){
             sig=instantiate_generic(n);
             n->callee=xstrdup(sig->name);
         }
+        if(sig&&sig->rettype&&sig->rettype->kind==TY_AUTO)
+            die("%s:%d: cannot infer the return type of '%s' here (it is used before any `return value` has been seen, e.g. a recursive call)",
+                n->file,n->line,n->callee);
         if(sig){
             /* check arg count */
             if(n->args.n!=sig->params.n)
@@ -1778,6 +2013,7 @@ static void tc_stmt(Node *n,TypeRef *ret_type,int in_loop){
     }
     case N_RETURN:{
         TypeRef *et=n->left?tc_expr(n->left,ret_type):mktype(TY_VOID,NULL,NULL);
+        if(ret_type&&ret_type->kind==TY_AUTO)*ret_type=*et;   /* `-> auto`: the first return decides the type */
         if(ret_type&&ret_type->kind!=TY_VOID&&!types_compat(ret_type,et))
             die("%s:%d: return type mismatch: function returns %s, got %s",
                 n->file,n->line,type_name(ret_type),type_name(et));
@@ -1930,12 +2166,39 @@ static void check_toplevel_dups(Node *prog){
         warn("no 'main' function defined (fine for a library object; a linked program needs one)");
 }
 
+/* type-check one function body. Re-entrant: an instance whose `-> auto` return type
+   must be inferred is checked in the middle of its caller. */
+static void tc_function(Node *n){
+    int saved_ntvars=ntvars,saved_scope=scope_base;const char *saved_fn=cur_fn_name;
+    if(global_tvars_end>0)ntvars=global_tvars_end;   /* callee must not see the caller's locals */
+    scope_base=ntvars;   /* params form the outermost local scope */
+    for(int j=0;j<n->params.n;j++){
+        check_redecl(n->params.d[j].name,n);
+        push_tvar(n->params.d[j].name,n->params.d[j].type);
+    }
+    cur_fn_name=n->fname;
+    n->tc_done=1;
+    tc_stmts(&n->body,n->rettype,0);
+    if(n->rettype&&n->rettype->kind==TY_AUTO)n->rettype->kind=TY_VOID;   /* `-> auto` that never returned a value */
+    if(n->rettype&&n->rettype->kind!=TY_VOID&&!n->is_extern&&!block_returns(&n->body))
+        warn("%s:%d: control reaches end of non-void function '%s'",n->file,n->line,n->fname);
+    cur_fn_name=saved_fn;
+    ntvars=saved_ntvars;/* pop function scope */
+    scope_base=saved_scope;
+}
+
 static void check_decl_types(Node *prog){
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
         if(n->kind==N_FUNC){
-            if(n->rettype&&(type_contains(n->rettype,TY_ANY)||type_contains(n->rettype,TY_AUTO)))
-                die("%s:%d: function '%s': `generic`/`auto` cannot be a return type",n->file,n->line,n->fname);
+            if(n->rettype&&type_contains(n->rettype,TY_ANY))
+                die("%s:%d: function '%s': `generic` cannot be a return type",n->file,n->line,n->fname);
+            if(n->rettype&&type_contains(n->rettype,TY_AUTO)){
+                if(n->rettype->kind!=TY_AUTO)
+                    die("%s:%d: function '%s': `auto` cannot be nested inside another return type",n->file,n->line,n->fname);
+                if(!has_any_param(&n->params))
+                    die("%s:%d: function '%s': `-> auto` needs at least one `generic` parameter; name the return type of a plain function",n->file,n->line,n->fname);
+            }
             for(int j=0;j<n->params.n;j++){
                 TypeRef *pt=n->params.d[j].type;
                 if(type_contains(pt,TY_AUTO))
@@ -2046,21 +2309,8 @@ static void typecheck(Node *prog){
     /* second pass: type-check each function body */
     for(int i=0;i<prog->body.n;i++){
         Node *n=prog->body.d[i];
-        if(n->kind!=N_FUNC||n->is_generic)continue;   /* templates are only checked per instance */
-        int saved_ntvars=ntvars;
-        scope_base=ntvars;   /* params form the outermost local scope */
-        /* push params into scope */
-        for(int j=0;j<n->params.n;j++){
-            check_redecl(n->params.d[j].name,n);
-            push_tvar(n->params.d[j].name,n->params.d[j].type);
-        }
-        cur_fn_name=n->fname;
-        tc_stmts(&n->body,n->rettype,0);
-        if(n->rettype&&n->rettype->kind!=TY_VOID&&!n->is_extern&&!block_returns(&n->body))
-            warn("%s:%d: control reaches end of non-void function '%s'",n->file,n->line,n->fname);
-        cur_fn_name=NULL;
-        ntvars=saved_ntvars;/* pop function scope */
-        scope_base=0;
+        if(n->kind!=N_FUNC||n->is_generic||n->tc_done)continue;   /* templates are only checked per instance */
+        tc_function(n);
     }
 }
 
@@ -2681,6 +2931,9 @@ static void gen_expr(Node *n){
                 out("    call %s\n    addl $4,%%esp\n",
                     is_str2?"_flr_print_str":"_flr_print_int");
                 break;
+            }
+            if(conv_kind(n->callee)>=0&&n->args.n==1&&std_builtin_always(n->callee)){
+                gen_expr(n->args.d[0]);gen_convert32(n->args.d[0]->etype,n->etype);break;
             }
             if(strcmp(n->callee,"len")==0&&n->args.n==1){
                 gen_expr(n->args.d[0]);out("    movl (%%eax),%%eax\n");break;
@@ -3802,6 +4055,10 @@ static void gen_expr64(Node *n){
             break;
         }
 
+        if(conv_kind(n->callee)>=0&&nargs==1&&std_builtin_always(n->callee)){
+            gen_expr64(n->args.d[0]);gen_convert64(n->args.d[0]->etype,n->etype);
+            break;
+        }
         /* len(array): the element count lives in the first quad of the array header */
         if((has_std||std_builtin_always(n->callee))&&strcmp(n->callee,"len")==0&&nargs==1){
             gen_expr64(n->args.d[0]);

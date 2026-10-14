@@ -1,0 +1,10 @@
+# ERROR: cannot infer the return type
+func f(n: generic) -> auto {
+    if (n > 0) {
+        return f(n - 1)
+    }
+    return n
+}
+func main() -> void {
+    x: auto = f(3)
+}

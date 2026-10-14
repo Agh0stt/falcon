@@ -1,0 +1,9 @@
+# REALSTD: 32
+# STDIN: 2.5|7.25|0.5
+# STDOUT: 5.000000|x? 7.250000|0.500000
+import "std"
+func main() -> void {
+    print(read_double() * 2.0d)
+    print(input_double("x? "))
+    print(read_float())
+}

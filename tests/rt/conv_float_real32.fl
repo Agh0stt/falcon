@@ -1,0 +1,20 @@
+# REALSTD: 32
+# STDOUT: 2|-2|3|7.000000|5.000000|2|-125.000000|3.141590|0.100000|42|0.000000|1000.000000|-0.500000
+import "std"
+func main() -> void {
+    d: double = 2.7d
+    f: float = 3.9
+    print(to_int(d))
+    print(to_int(0.0d - d))
+    print(to_int(f))
+    print(to_double(7))
+    print(to_float(5))
+    print(to_long(d))
+    print(str_to_double("  -12.5e1"))
+    print(str_to_double("3.14159"))
+    print(str_to_float("0.1"))
+    print(to_int(str_to_double("41.99")) + 1)
+    print(str_to_double("abc"))
+    print(str_to_double("1e3"))
+    print(str_to_double("-.5"))
+}
